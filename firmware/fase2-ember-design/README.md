@@ -174,6 +174,23 @@ the minutes it might sit open and unconfigured - this project cares about BLE la
 than almost anything else (see the tip-temp investigation below), so a library default that
 blocks for the portal's lifetime was not acceptable here.
 
+**Bug found and fixed the same day: the portal's AP couldn't be joined at all.** The
+firmware's own log showed the AP starting normally (`StartAP`, `AP IP address:
+192.168.4.1`), but both a phone and a Mac reported "could not be joined" when trying to
+connect to it. **Root cause:** this project's continuous BLE scan
+(`setInterval(100)`==`setWindow(100)`, effectively 100% duty cycle - see below) shares
+ESP32's single 2.4GHz radio with WiFi via the same coexistence layer already documented
+above as slowing BLE polling when WiFi is on - this is that same contention mirrored the
+other direction, starving the softAP of the airtime it needs to complete a client's
+association handshake. iOS/macOS are strict about that timing and fail outright rather than
+retry. A first fix attempt - a single `NimBLEScan::stop()` call in the portal-open callback
+- wasn't enough: the log showed `E NimBLEScan: Failed to cancel scan; rc=30` (the BLE host
+task rejected the cancel, likely mid-scan-window right as WiFi was switching into `AP_STA`
+mode), so the scan silently kept running the whole time. **Fix:** retry the stop every
+`loop()` tick for as long as the portal is open (`if (pScan->isScanning()) pScan->stop();`),
+resuming the scan only once the portal actually closes. **User-confirmed working** after
+this fix - the portal could be joined from both a phone and a Mac.
+
 **Credentials are cached in RAM after the first successful connect, and
 `WiFi.persistent(false)` is set from then on** - a lesson borrowed from a sibling project
 (TDAI-2170): `WiFi.begin(ssid, pass)` with persistent storage left at its default writes NVS

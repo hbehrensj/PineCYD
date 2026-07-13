@@ -207,6 +207,16 @@ static const int WIFI_CONFIG_BUTTON_PIN = 0;
 static void onConfigPortalStart(WiFiManager* wmPtr) {
   Serial.printf("[WiFi] Config portal open - join \"%s\" and visit http://192.168.4.1\n", WIFI_AP_NAME);
   wifiConfigActive = true;
+  // The continuous BLE scan (setInterval==setWindow, ~100% duty cycle - see setup()) shares
+  // ESP32's single 2.4GHz radio with WiFi via its WiFi/BT coexistence layer, same root cause
+  // as the documented BLE-poll slowdown when WiFi is on (see README.md) - just mirrored here.
+  // Confirmed live, 2026-07-13: the AP started fine per this project's own log
+  // (StartAP/AP IP address both printed), but a phone and a Mac both got "could not join" -
+  // the softAP's association handshake needs timely airtime iOS/macOS won't tolerate
+  // stalling on. Pausing the scan for the portal's duration (resumed in loop() once it
+  // closes) is a low-cost tradeoff: the Pinecil isn't expected to be the focus while the
+  // user is actively configuring WiFi anyway.
+  NimBLEDevice::getScan()->stop();
   lv_scr_load(scr_wifi_config);
   lv_timer_handler(); // flush this one frame now; wm.process() drives everything from here
 }
@@ -688,9 +698,26 @@ void loop() {
   // once the portal closes (saved successfully, or its own timeout - see setup()).
   if (clockScreenActive) {
     wm.process();
+
+    // onConfigPortalStart()'s stop() call is a single synchronous attempt made right as
+    // WiFi switches into AP_STA mode - confirmed live, 2026-07-13, that NimBLE's host task
+    // can be mid-scan-window right then and reject it ("Failed to cancel scan; rc=30"),
+    // silently leaving the scan running for the portal's whole lifetime (still 100% duty
+    // cycle - see setup()) even though the code intended to pause it. Retrying here every
+    // loop() tick while the portal is active is far more robust than a one-shot call.
+    if (wifiConfigActive) {
+      NimBLEScan* pScan = NimBLEDevice::getScan();
+      if (pScan->isScanning()) pScan->stop();
+    }
+
     if (wifiConfigActive && !wm.getConfigPortalActive()) {
       wifiConfigActive = false;
       lv_scr_load(scr_clock);
+      // Resume the Pinecil scan paused above - safe unconditionally here: clockScreenActive
+      // can only be true if no Pinecil is connected yet (a connect would have already
+      // flipped it false above), so scanning was never needed to stay off.
+      Serial.println("[WiFi] Config portal closed - resuming Pinecil scan");
+      NimBLEDevice::getScan()->start(0, false, true);
     }
   }
 

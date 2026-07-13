@@ -48,6 +48,10 @@ found and fixed on real hardware.
   confirmed by direct before/after measurement, and noticeably slowed BLE polling via
   radio coexistence contention - now mitigated by turning WiFi off automatically whenever
   a Pinecil is connected, back on only while the clock is showing.
+- **The same radio coexistence contention runs the other way too**: the WiFi setup
+  portal's access point couldn't be joined at all (confirmed on both iOS and macOS) while
+  this project's continuous BLE scan was left running - fixed by pausing the scan for as
+  long as the portal is open. See the firmware README for the full root-cause writeup.
 
 ## Building
 
@@ -60,6 +64,27 @@ pio run -t upload
 No compile-time WiFi credentials needed - on first boot the CYD opens its own
 `PineCYD-Setup` WiFi network with a captive config portal (see the firmware's own README
 for the full setup flow, cadence, and the BOOT-button reset).
+
+## Flashing a release
+
+Prebuilt binaries are attached to each [GitHub
+Release](https://github.com/hbehrensj/PineCYD/releases) - no PlatformIO or compiling
+needed:
+
+- **`pinecyd-firmware-factory.bin`** - the one most people want. A single merged image
+  (bootloader + partition table + app) for a brand-new or blank board. Flash at offset
+  `0x0`.
+- **`pinecyd-firmware.bin`** - app only, for updating a board that's already running
+  PineCYD. Flash at offset `0x10000`.
+
+```sh
+pip install esptool
+esptool.py --chip esp32 --port /dev/ttyUSB0 write_flash 0x0 pinecyd-firmware-factory.bin
+```
+
+(Use your board's actual serial port - e.g. `/dev/cu.usbserial-XXXX` on macOS, `COM3` on
+Windows.) First boot opens the `PineCYD-Setup` WiFi network to configure your own network -
+see "No compile-time WiFi credentials needed" above.
 
 ## Layout
 

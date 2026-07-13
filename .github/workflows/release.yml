@@ -1,0 +1,42 @@
+name: Build & Release firmware
+
+# Tag a commit to publish a release with flashable binaries:
+#   git tag v0.2.0 && git push origin v0.2.0
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio
+
+      - name: Build firmware
+        working-directory: firmware/fase2-ember-design
+        run: pio run -e esp32dev
+
+      - name: Stage release binaries
+        run: |
+          mkdir -p dist
+          cp firmware/fase2-ember-design/.pio/build/esp32dev/firmware.bin dist/pinecyd-firmware.bin
+          cp firmware/fase2-ember-design/.pio/build/esp32dev/firmware.factory.bin dist/pinecyd-firmware-factory.bin
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/pinecyd-firmware.bin
+            dist/pinecyd-firmware-factory.bin

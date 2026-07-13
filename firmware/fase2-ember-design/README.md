@@ -171,6 +171,20 @@ credentials - not committed, and deliberately never typed into any AI conversati
   Pinecil is connected (confirmed once: cycle_ms back in the ~554-663ms range immediately
   after WiFi turned off), but don't expect poll cycles faster than ~554ms even with the
   toggle - that's the real floor, not a WiFi symptom.
+
+**Tip-temp-only fast poll (2026-07-13, at the user's suggestion):** since six sequential
+reads is what makes the full cycle slow, and the tip-temp number is the one value that
+actually needs to feel responsive while soldering (the whole reason this project exists -
+see the handoff doc), it's now polled on its own, independent of the 6-characteristic full
+cycle (`TIP_POLL_INTERVAL_MS` in `main.cpp`). **Measured real hardware: a single-
+characteristic read takes only ~20-45ms** (much faster than the ~90-100ms/read implied by
+dividing the 6-read cycle time by 6 - reading one characteristic in isolation avoids
+whatever per-characteristic overhead accumulates across six sequential attribute-handle
+switches). This gives roughly 15-20Hz visible tip-temp updates - a large jump from the full
+cycle's ~1.5-2Hz - while the chart, target, power, mode, and handle-temp still update on
+the original slower full-cycle cadence (deliberately: pushing tip temp into the chart at
+the fast rate would desync it from the setpoint-reference series, which only advances on
+the full cycle - see the code comment in `loop()`).
 - **Backlight flicker** observed with WiFi on, powered via a laptop USB port - resolved by
   switching to a dedicated power source. Consistent with WiFi TX current spikes (routinely
   300-500mA bursts, well above BLE alone) exceeding what a laptop USB port can supply

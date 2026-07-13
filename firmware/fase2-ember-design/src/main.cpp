@@ -67,7 +67,13 @@ static const char* CHAR_OP_MODE       = "d85ef00D-168e-4a71-aa55-33e27f9bc533"; 
 static const char* CHAR_EST_WATTS     = "d85ef00E-168e-4a71-aa55-33e27f9bc533"; // uint32 LE, decwatts (IronOS: x10WattHistory)
 static const char* SERVICE_BULK_DATA  = "9eae1000-9d0d-48c5-aa55-33e27f9bc533"; // scan filter only
 
-static const uint32_t POLL_INTERVAL_MS = 500;
+static const uint32_t POLL_INTERVAL_MS = 500; // full cycle: all 6 characteristics, chart+labels
+// Tip temp read on its own, much faster, in between full cycles - at the user's
+// suggestion, 2026-07-13: reading only 1 characteristic instead of 6 cuts the per-read
+// round trip (each ~90-100ms) out of the critical path for the number that actually needs
+// to feel responsive while soldering. 50ms is below the real read latency floor, so the
+// achieved rate is bounded by that floor (~90-100ms, ~10Hz), not by this constant.
+static const uint32_t TIP_POLL_INTERVAL_MS = 50;
 
 // IronOS OperatingMode enum values that matter here (confirmed from
 // Ralim/IronOS source/Core/Threads/UI/logic/OperatingModes.h, 2026-07-13; note the enum
@@ -573,6 +579,23 @@ void loop() {
     struct tm timeinfo;
     if (getLocalTime(&timeinfo, 100)) {
       lv_label_set_text_fmt(label_clock_time, "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
+    }
+  }
+
+  // Fast tip-only poll (see TIP_POLL_INTERVAL_MS) - just the number, not the chart (the
+  // chart still advances only on the full cycle below, so its "LAST 2 MIN" timing/HISTORY_
+  // POINTS assumption and the setpoint-reference series stay in lockstep; pushing tip
+  // faster than that would desync the two series visually).
+  static uint32_t lastTipPoll = 0;
+  if (connected && pChrLiveTemp && millis() - lastTipPoll >= TIP_POLL_INTERVAL_MS) {
+    lastTipPoll = millis();
+    uint32_t t0 = micros();
+    bool     okTip;
+    uint32_t liveTemp  = readU32LE(pChrLiveTemp, okTip);
+    uint32_t tipCycleUs = micros() - t0;
+    if (okTip) {
+      lv_label_set_text_fmt(label_tip_value, "%lu", liveTemp);
+      Serial.printf("%lu,tip_only_temp=%lu,cycle_ms=%.1f\n", millis(), liveTemp, tipCycleUs / 1000.0);
     }
   }
 

@@ -185,6 +185,25 @@ cycle's ~1.5-2Hz - while the chart, target, power, mode, and handle-temp still u
 the original slower full-cycle cadence (deliberately: pushing tip temp into the chart at
 the fast rate would desync it from the setpoint-reference series, which only advances on
 the full cycle - see the code comment in `loop()`).
+
+**Update, same day: the fast poll wasn't visibly faster on screen at first** - the user
+correctly pushed back after testing while the iron was actively heating. Root cause,
+found by comparing tip-only `cycle_ms` over a longer run: it stayed fast (~20-45ms) for
+only the first few seconds of each connection, then jumped to ~85-103ms/read and stayed
+there - not related to rendering (a chart-redraw-cost theory was tested and ruled out
+along the way, see the reduced `HISTORY_POINTS`/decoupled chart-push-rate change in the
+code, which helped a little but wasn't the main cause). **The actual cause:**
+`NimBLEClientCallbacks::onConnParamsUpdateRequest()` defaults to auto-accepting *any*
+connection-parameter change the Pinecil proposes. A few seconds into every connection the
+Pinecil renegotiates to a slower interval, after which *every* GATT read costs a full
+connection interval no matter how simple - not a rendering or overhead difference, a
+genuinely slower radio schedule. **Fix:** override that callback to reject the peer's
+request, keeping this project's own `setConnectionParams(12, 12, ...)` (15ms) in effect
+for the life of the connection. Confirmed on real hardware over a continuous 33-second
+capture while the iron heated from 39°C to 349°C: tip-only reads held steady at 20-55ms
+throughout, no degradation, with the previously-intended ~5-6 fast updates landing between
+each full cycle.
+
 - **Backlight flicker** observed with WiFi on, powered via a laptop USB port - resolved by
   switching to a dedicated power source. Consistent with WiFi TX current spikes (routinely
   300-500mA bursts, well above BLE alone) exceeding what a laptop USB port can supply

@@ -32,14 +32,25 @@
 #include <NimBLEDevice.h>
 #include <TFT_eSPI.h>
 #include <WiFi.h>
+// TFT_eSPI.h (included above) defines FS_NO_GLOBALS before its own #include <FS.h>, to get
+// SPIFFS support for smooth fonts without polluting the global namespace - this permanently
+// suppresses FS.h's "using fs::FS;" for the rest of this translation unit (macros aren't
+// scoped, and FS.h's include guard means a later plain #include <FS.h> is a no-op anyway).
+// WebServer.h (pulled in by WiFiManager.h) needs bare `FS` at global scope, so restore the
+// alias explicitly - confirmed by a real build failure, 2026-07-13, not a hypothetical
+// include-order nicety.
+using fs::FS;
+using fs::File;
+#include <WiFiManager.h>
 #include <esp_system.h>
 #include <lvgl.h>
 #include <time.h>
 
-// Not committed - copy include/secrets.h.example to include/secrets.h and fill in your own
-// WiFi credentials. Kept out of the repo (see .gitignore) so real credentials never end up
-// in version control or in this conversation's transcript.
-#include "secrets.h"
+// WiFi credentials are no longer compile-time (see the removed secrets.h) - WiFiManager
+// (2026-07-13) puts the CYD into its own AP + captive portal on first boot (or whenever no
+// stored network is reachable), so a single prebuilt release binary works for anyone
+// without rebuilding with their own credentials baked in. See README.md for the setup flow
+// and setup()'s WiFiManager block below.
 
 // Experimental, 2026-07-13: WiFi + NTP, running continuously alongside BLE + LVGL, at the
 // user's explicit choice after being told the tradeoff - this is a materially different
@@ -152,6 +163,68 @@ static lv_obj_t* scr_dashboard;
 static lv_obj_t* scr_clock;
 static lv_obj_t* label_clock_time;
 static bool      clockScreenActive = false; // set explicitly once at boot, see setup()
+
+// WiFi captive-portal config screen (shown only while the WiFiManager AP+portal is open).
+static lv_obj_t* scr_wifi_config;
+
+// --- WiFi captive portal (2026-07-13) ---
+// Replaces compile-time secrets.h credentials so a single prebuilt release binary works for
+// anyone. Cadence is per the user's explicit spec: try the saved network for 30s; if that
+// fails, automatically open the config portal; if the portal itself isn't configured either,
+// give up for now and retry the whole thing again every 2 minutes - never block forever in
+// either state. WiFiManager's non-blocking mode (setConfigPortalBlocking(false) below) is
+// what makes this safe to drive from this project's own loop() without stalling BLE/LVGL for
+// the duration of a connect attempt or an open portal - process() below only ever does a
+// small chunk of work per call, same as lv_timer_handler().
+static WiFiManager    wm;
+static bool           wifiConfigActive      = false; // mirrors wm.getConfigPortalActive(), see loop()
+static const char*    WIFI_AP_NAME          = "PineCYD-Setup";
+static const uint32_t WIFI_CONNECT_TIMEOUT_S = 30;     // give up on the saved network after this long
+static const uint32_t WIFI_RETRY_INTERVAL_MS = 120000; // 2 min - also used as the portal's own timeout, see setup()
+
+// Credentials cached in RAM after the first successful connect this session, and used for
+// every reconnect from then on instead of a no-arg WiFi.begin(). Borrowed from a lesson in a
+// sibling project (TDAI-2170): WiFi.begin(ssid, pass) with WiFi.persistent() left at its
+// default (true) writes NVS flash on every call, which is fine for an occasional
+// outage-driven reconnect but not for this project's on/off toggle, which reconnects on
+// every single Pinecil disconnect - potentially many times per session. Set
+// WiFi.persistent(false) once these are cached (see loop()'s NTP-edge block) so that cost
+// disappears entirely; only the initial WiFiManager-driven connect/portal save still writes
+// flash, same as any other WiFiManager use.
+static String g_wifiSsid;
+static String g_wifiPsk;
+
+// GPIO0 is this board's BOOT button (also used for entering flash mode, but freely readable
+// at runtime afterwards - confirmed not to collide with any TFT pin in platformio.ini).
+// Holding it down through boot forces a fresh WiFi config portal even if a stored network
+// would otherwise still connect - useful for switching networks without re-flashing.
+static const int WIFI_CONFIG_BUTTON_PIN = 0;
+
+// Fires when WiFiManager's AP+portal actually opens (saved network unreachable within
+// WIFI_CONNECT_TIMEOUT_S, or the BOOT-button reset below forced it). Gives the user an
+// on-screen instruction instead of a silently-frozen clock - this project's screen is
+// otherwise not being driven by anything else while the portal is up.
+static void onConfigPortalStart(WiFiManager* wmPtr) {
+  Serial.printf("[WiFi] Config portal open - join \"%s\" and visit http://192.168.4.1\n", WIFI_AP_NAME);
+  wifiConfigActive = true;
+  lv_scr_load(scr_wifi_config);
+  lv_timer_handler(); // flush this one frame now; wm.process() drives everything from here
+}
+
+// Kicks off a (re)connect attempt, used from setup(), the WiFi on/off toggle, and the
+// periodic retry in loop() alike. Uses the cached credentials directly once we have them
+// (fast path, no flash write - see g_wifiSsid/g_wifiPsk above); otherwise falls back to
+// WiFiManager's autoConnect(), which tries any NVS-stored network and opens the config
+// portal if that fails. Both paths are non-blocking (setConfigPortalBlocking(false) is set
+// once in setup()) - safe to call from loop() without stalling BLE/LVGL.
+static void connectWifiNow() {
+  WiFi.mode(WIFI_STA);
+  if (g_wifiSsid.length()) {
+    WiFi.begin(g_wifiSsid.c_str(), g_wifiPsk.c_str());
+  } else {
+    wm.autoConnect(WIFI_AP_NAME);
+  }
+}
 
 static const char* resetReasonToStr(esp_reset_reason_t r) {
   switch (r) {
@@ -328,6 +401,25 @@ static void buildClockUi() {
   lv_obj_t* subLabel = makeLabel(scr_clock, 0, 0, &lv_font_montserrat_12, COLOR_GRAY, "SCANNING FOR PINECIL...");
   lv_obj_set_style_text_letter_space(subLabel, 1, 0);
   lv_obj_align(subLabel, LV_ALIGN_BOTTOM_MID, 0, -12);
+}
+
+// Shown only while the WiFiManager captive portal is open (see onConfigPortalStart()) -
+// static instructions, since nothing else is happening on this screen while it's up.
+static void buildWifiConfigUi() {
+  scr_wifi_config = lv_obj_create(NULL);
+  lv_obj_set_style_bg_color(scr_wifi_config, COLOR_BLACK, 0);
+  lv_obj_set_style_bg_opa(scr_wifi_config, LV_OPA_COVER, 0);
+
+  lv_obj_t* title = makeLabel(scr_wifi_config, 0, 0, &lv_font_montserrat_20, COLOR_WHITE, "WIFI SETUP");
+  lv_obj_align(title, LV_ALIGN_CENTER, 0, -40);
+
+  lv_obj_t* joinLabel = makeLabel(scr_wifi_config, 0, 0, &lv_font_montserrat_14, COLOR_AMBER, "");
+  lv_label_set_text_fmt(joinLabel, "Join WiFi: %s", WIFI_AP_NAME);
+  lv_obj_align(joinLabel, LV_ALIGN_CENTER, 0, -5);
+
+  lv_obj_t* urlLabel = makeLabel(scr_wifi_config, 0, 0, &lv_font_montserrat_12, COLOR_LIGHT_GRAY,
+                                  "Then open http://192.168.4.1");
+  lv_obj_align(urlLabel, LV_ALIGN_CENTER, 0, 25);
 }
 
 static UiState modeToUiState(uint32_t rawMode) {
@@ -510,28 +602,32 @@ void setup() {
 
   buildUi();
   buildClockUi();
+  buildWifiConfigUi();
   lv_scr_load(scr_clock); // not connected to a Pinecil yet - start on the clock
   clockScreenActive = true;
   lv_timer_handler();
 
   Serial.printf("[BOOT] Free heap after display+LVGL init: %u bytes\n", ESP.getFreeHeap());
 
-  // WiFi + NTP (experimental, see file header) - connect once at boot, bounded wait, then
-  // leave running continuously alongside BLE for the duration of this test.
-  WiFi.mode(WIFI_STA);
-  WiFi.setAutoReconnect(true);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.printf("[BOOT] Connecting to WiFi \"%s\"...\n", WIFI_SSID);
-  uint32_t wifiWaitStart = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - wifiWaitStart < 15000) {
-    delay(250);
+  // WiFi + NTP (experimental, see file header) - kicked off once at boot, then left running
+  // continuously alongside BLE, toggled off only while a Pinecil is connected (see loop()).
+  // Credentials are no longer compile-time (see the removed secrets.h) - see the WiFi
+  // captive-portal block above (wm, connectWifiNow()) for how this connects.
+  pinMode(WIFI_CONFIG_BUTTON_PIN, INPUT_PULLUP);
+  bool bootButtonHeld = (digitalRead(WIFI_CONFIG_BUTTON_PIN) == LOW);
+
+  wm.setConfigPortalBlocking(false); // critical: keeps BLE scanning/LVGL alive during setup too
+  wm.setConnectTimeout(WIFI_CONNECT_TIMEOUT_S);
+  wm.setConfigPortalTimeout(WIFI_RETRY_INTERVAL_MS / 1000);
+  wm.setAPCallback(onConfigPortalStart);
+
+  if (bootButtonHeld) {
+    Serial.println("[BOOT] BOOT button held at boot - resetting stored WiFi config and forcing the portal");
+    wm.resetSettings();
   }
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("[BOOT] WiFi connected, IP=%s\n", WiFi.localIP().toString().c_str());
-    configTzTime("CET-1CEST,M3.5.0,M10.5.0/3", "pool.ntp.org", "time.google.com");
-  } else {
-    Serial.println("[BOOT] WiFi connect timed out after 15s - clock will show once/if it connects later");
-  }
+
+  connectWifiNow(); // returns almost immediately either way; loop() drives the rest
+  Serial.println("[BOOT] WiFi connect/portal kicked off (non-blocking) - see loop() for progress");
   Serial.printf("[BOOT] Free heap after WiFi init: %u bytes\n", ESP.getFreeHeap());
 
   NimBLEDevice::init("PineCYD-Fase2");
@@ -568,30 +664,64 @@ void loop() {
   // and removes the WiFi/BT coexistence contention that was measurably slowing down BLE
   // polling - see README.md), back on only while showing the clock, which is the only
   // thing that needs it. At the user's suggestion, 2026-07-13.
-  bool shouldShowClock = !connected;
+  static uint32_t lastWifiAttempt = 0; // shared with the retry block below
+  bool            shouldShowClock = !connected;
   if (shouldShowClock != clockScreenActive) {
     clockScreenActive = shouldShowClock;
     lv_scr_load(clockScreenActive ? scr_clock : scr_dashboard);
     if (clockScreenActive) {
       Serial.println("[WiFi] Pinecil disconnected - turning WiFi back on for the clock");
-      WiFi.mode(WIFI_STA);
-      WiFi.begin(WIFI_SSID, WIFI_PASSWORD); // non-blocking; connects in the background
+      connectWifiNow();
+      lastWifiAttempt = millis();
     } else {
       Serial.println("[WiFi] Pinecil connected - turning WiFi off to free heap/radio time");
+      // Don't leave the AP+webserver running while intentionally powering the radio off.
+      if (wm.getConfigPortalActive()) wm.stopConfigPortal();
+      wifiConfigActive = false;
       WiFi.disconnect(true);
       WiFi.mode(WIFI_OFF);
     }
   }
 
+  // Services the non-blocking captive portal (near-zero cost when none is open - same
+  // shape as lv_timer_handler() above), and drives the on-screen switch back to the clock
+  // once the portal closes (saved successfully, or its own timeout - see setup()).
+  if (clockScreenActive) {
+    wm.process();
+    if (wifiConfigActive && !wm.getConfigPortalActive()) {
+      wifiConfigActive = false;
+      lv_scr_load(scr_clock);
+    }
+  }
+
   // NTP only needs (re)configuring once per WiFi (re)connection, detected here rather than
-  // blocking loop() while (re)connecting the way setup()'s initial connect does.
+  // blocking loop() while (re)connecting the way setup()'s initial connect does. Also where
+  // credentials get cached in RAM for connectWifiNow()'s fast path (see g_wifiSsid/g_wifiPsk).
   static bool wifiWasConnected = false;
   bool        wifiNowConnected = (WiFi.status() == WL_CONNECTED);
   if (wifiNowConnected && !wifiWasConnected) {
-    Serial.println("[WiFi] Connected, configuring NTP");
+    Serial.printf("[WiFi] Connected, IP=%s - configuring NTP\n", WiFi.localIP().toString().c_str());
     configTzTime("CET-1CEST,M3.5.0,M10.5.0/3", "pool.ntp.org", "time.google.com");
+    if (g_wifiSsid.isEmpty()) {
+      g_wifiSsid = WiFi.SSID();
+      g_wifiPsk  = WiFi.psk();
+      WiFi.persistent(false); // see g_wifiSsid/g_wifiPsk comment - avoids a flash write on
+                              // every one of this project's frequent on/off-toggle reconnects
+      Serial.println("[WiFi] Cached credentials in RAM for future reconnects");
+    }
   }
   wifiWasConnected = wifiNowConnected;
+
+  // Retry cadence per the user's spec, 2026-07-13: if we're not connected and no portal is
+  // open (i.e. a prior attempt's 30s connect timeout and, if triggered, its 120s portal
+  // window both ran out unconfigured), try the whole thing again every 2 minutes rather
+  // than giving up for the rest of the session.
+  if (clockScreenActive && !wifiNowConnected && !wm.getConfigPortalActive() &&
+      millis() - lastWifiAttempt >= WIFI_RETRY_INTERVAL_MS) {
+    lastWifiAttempt = millis();
+    Serial.println("[WiFi] Not connected, no portal open - retrying");
+    connectWifiNow();
+  }
 
   static uint32_t lastClockUpdate = 0;
   if (clockScreenActive && millis() - lastClockUpdate >= 1000) {

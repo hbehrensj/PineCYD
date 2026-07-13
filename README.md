@@ -57,9 +57,9 @@ pio run
 pio run -t upload
 ```
 
-Needs WiFi credentials: copy `firmware/fase2-ember-design/include/secrets.h.example` to
-`secrets.h` in the same directory and fill in your own `WIFI_SSID`/`WIFI_PASSWORD`
-(gitignored, never commit real credentials).
+No compile-time WiFi credentials needed - on first boot the CYD opens its own
+`PineCYD-Setup` WiFi network with a captive config portal (see the firmware's own README
+for the full setup flow, cadence, and the BOOT-button reset).
 
 ## Layout
 

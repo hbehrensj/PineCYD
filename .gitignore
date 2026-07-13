@@ -5,7 +5,3 @@ compile_commands.json
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch/
-
-# Real WiFi credentials - copy secrets.h.example to secrets.h and fill in locally
-include/secrets.h
-**/include/secrets.h

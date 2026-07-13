@@ -152,8 +152,43 @@ back on the moment the Pinecil disconnects again, and NTP is reconfigured automa
 each reconnect (detected via a connected-state edge, not a blocking wait, so `loop()` never
 stalls waiting for WiFi).
 
-Requires `include/secrets.h` (gitignored, copy `secrets.h.example` and fill in real WiFi
-credentials - not committed, and deliberately never typed into any AI conversation).
+### WiFi setup: captive portal, no compile-time credentials
+
+Originally required a gitignored `include/secrets.h` with a hardcoded SSID/password -
+replaced (2026-07-13) with [`tzapu/WiFiManager`](https://github.com/tzapu/WiFiManager) so a
+single prebuilt release binary works for anyone, no rebuild needed. First boot (or any boot
+with no reachable saved network): the CYD opens its own AP (`PineCYD-Setup`) with a captive
+portal; join it, browse to `http://192.168.4.1`, and pick your network. Credentials are
+saved to NVS and the clock screen shows join/URL instructions while the portal is open.
+
+**Cadence, per explicit spec:** try the saved network for 30s (`WIFI_CONNECT_TIMEOUT_S`); if
+that fails, auto-open the config portal; if the portal itself isn't configured either (also
+120s, `WIFI_RETRY_INTERVAL_MS`), give up for now and retry the whole thing again every 2
+minutes - never block forever in either state. **Hold the BOOT button (GPIO0) through
+power-on** to force a fresh portal (`wm.resetSettings()` + reconnect) even if a stored
+network would otherwise still work - useful for switching networks without re-flashing.
+
+**Non-blocking by design** (`wm.setConfigPortalBlocking(false)` + `wm.process()` in
+`loop()`), specifically because an auto-opened portal must not stall BLE scanning/LVGL for
+the minutes it might sit open and unconfigured - this project cares about BLE latency more
+than almost anything else (see the tip-temp investigation below), so a library default that
+blocks for the portal's lifetime was not acceptable here.
+
+**Credentials are cached in RAM after the first successful connect, and
+`WiFi.persistent(false)` is set from then on** - a lesson borrowed from a sibling project
+(TDAI-2170): `WiFi.begin(ssid, pass)` with persistent storage left at its default writes NVS
+flash on every call, fine for an occasional outage-driven reconnect but not for this
+project's on/off toggle, which reconnects on every single Pinecil disconnect - potentially
+many times per session.
+
+**Known tradeoff, flagged rather than silently decided:** auto-opening the portal on a
+plain connect failure is a deliberate choice specific to this device. TDAI-2170's own
+`net_config.cpp` explicitly avoids this ("a temporary router outage must not turn the
+device into an unsolicited hotspot that needs manual reconfiguration") and instead only
+retries known credentials, forever, never auto-opening a portal - appropriate for an
+unattended device. PineCYD sits on a desk where the user would see the portal appear, so
+the tradeoff was judged acceptable here - but it's a real divergence from the other
+project's hard-won lesson, not an oversight.
 
 **Measured cost, real hardware:**
 - Free heap: ~155KB (BLE+LVGL alone) → **~71-72KB with WiFi connected** (continuous) →
@@ -289,5 +324,5 @@ pio run -t upload
 pio device monitor -b 115200
 ```
 
-Needs WiFi credentials: copy `include/secrets.h.example` to `include/secrets.h` and fill
-in your own `WIFI_SSID`/`WIFI_PASSWORD` (gitignored, never commit real credentials).
+No compile-time WiFi credentials needed - connect the CYD to `PineCYD-Setup` after first
+boot to configure WiFi (see the captive-portal section above).

@@ -163,9 +163,14 @@ credentials - not committed, and deliberately never typed into any AI conversati
   OTA/spiffs) - the default ~1.31MB app partition couldn't fit the image at all once WiFi
   was linked in (needed ~1.51MB).
 - BLE poll `cycle_ms` got noticeably slower and more variable with WiFi continuously on
-  (557-1111ms vs. a steady ~560-660ms without it) - a direct, measurable sign of ESP32
-  WiFi/BT radio coexistence contention. The on/off toggle above should substantially
-  reduce this while a Pinecil is connected, since WiFi is off during exactly that time.
+  (557-1111ms vs. a steady ~554-663ms without it) - a direct, measurable sign of ESP32
+  WiFi/BT radio coexistence contention. **The ~554-663ms itself is not a WiFi cost** -
+  it's the intrinsic round-trip time for six sequential BLE characteristic reads on this
+  hardware, present with or without WiFi; only the *excess* above that floor (up to
+  1111ms) came from coexistence contention. The on/off toggle removes that excess while a
+  Pinecil is connected (confirmed once: cycle_ms back in the ~554-663ms range immediately
+  after WiFi turned off), but don't expect poll cycles faster than ~554ms even with the
+  toggle - that's the real floor, not a WiFi symptom.
 - **Backlight flicker** observed with WiFi on, powered via a laptop USB port - resolved by
   switching to a dedicated power source. Consistent with WiFi TX current spikes (routinely
   300-500mA bursts, well above BLE alone) exceeding what a laptop USB port can supply

@@ -204,6 +204,21 @@ capture while the iron heated from 39°C to 349°C: tip-only reads held steady a
 throughout, no degradation, with the previously-intended ~5-6 fast updates landing between
 each full cycle.
 
+**Update, same day again: still visible as a periodic stutter, even with the interval
+fix** - the user reported the display updated quickly now but "came in jerks." With the
+connection interval no longer degrading, the remaining cause was structural: a fast
+tip-only poll (~50ms) running alongside a periodic 6-read "full cycle" (~500ms) still
+meant every ~500ms, five extra reads landed back-to-back, briefly monopolizing the
+connection and interrupting the otherwise-smooth tip-temp cadence - visible as a stutter
+even though the *average* rate was fast. **Fix, at the user's suggestion:** replaced both
+polls with a single round-robin cycle - every cycle reads tip_temp plus exactly one of the
+other five characteristics (setpoint, dc_input, handle_temp, op_mode, est_watts) in
+rotation, so every cycle costs roughly the same instead of alternating between small and
+large bursts. Confirmed on real hardware: cycles landed at a uniform ~55ms (occasionally
+~70ms), each secondary value refreshing roughly every 275ms (5 cycles) - plenty for
+values that don't need tip-temp's responsiveness. **User-confirmed smooth on screen**,
+no more jerks, once this shipped.
+
 - **Backlight flicker** observed with WiFi on, powered via a laptop USB port - resolved by
   switching to a dedicated power source. Consistent with WiFi TX current spikes (routinely
   300-500mA bursts, well above BLE alone) exceeding what a laptop USB port can supply

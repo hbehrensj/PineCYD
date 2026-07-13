@@ -126,7 +126,13 @@ static uint32_t       disconnectCount = 0;
 // --- Display / LVGL ---
 static const uint16_t SCREEN_W = 320;
 static const uint16_t SCREEN_H = 240;
-static const int      HISTORY_POINTS = 240; // 2 min at 500ms poll, matches "TIP - LAST 2 MIN"
+// 2 min at 2000ms per chart point (see CHART_PUSH_INTERVAL_MS) - reduced from 240 points
+// at 500ms, 2026-07-13: redrawing a 240-point chart line turned out to cost ~450ms of
+// lv_timer_handler() time on every full-poll cycle (found while diagnosing why the fast
+// tip-only poll wasn't visibly faster on screen - it was being starved by this redraw,
+// not by BLE latency). At this display's ~310px chart width, 60 points is still smooth.
+static const int      HISTORY_POINTS = 60;
+static const uint32_t CHART_PUSH_INTERVAL_MS = 2000; // independent of the label/BLE poll rate
 
 TFT_eSPI                   tft = TFT_eSPI();
 static lv_disp_draw_buf_t  draw_buf;
@@ -284,7 +290,9 @@ static void buildUi() {
   lv_obj_set_style_pad_all(chart_history, 0, 0);
   lv_obj_set_style_size(chart_history, 0, LV_PART_INDICATOR); // hide point markers
   lv_obj_set_style_line_width(chart_history, 3, LV_PART_ITEMS);
-  lv_obj_set_style_line_rounded(chart_history, true, LV_PART_ITEMS);
+  // Rounded joints cost more to render per segment - not worth it for a fast-scrolling
+  // trend line at this size (found while cutting chart redraw cost, 2026-07-13).
+  lv_obj_set_style_line_rounded(chart_history, false, LV_PART_ITEMS);
   lv_chart_set_type(chart_history, LV_CHART_TYPE_LINE);
   lv_chart_set_div_line_count(chart_history, 0, 0);
   lv_chart_set_point_count(chart_history, HISTORY_POINTS);
@@ -399,6 +407,19 @@ class ClientCallbacks : public NimBLEClientCallbacks {
     lv_label_set_text_fmt(label_mode, "DISCONNECTED (x%u)", disconnectCount);
     lv_obj_set_style_text_color(label_mode, COLOR_GRAY, 0);
     NimBLEDevice::getScan()->start(0, false, true);
+  }
+
+  // Root-caused, 2026-07-13: NimBLEClientCallbacks' default here returns true (auto-accept
+  // any peer-proposed connection parameter update). The Pinecil renegotiates to a much
+  // slower interval a few seconds into every connection - every subsequent GATT read then
+  // costs a full connection interval regardless of how simple the read is (measured:
+  // ~20-30ms/read before this renegotiation, ~85-103ms/read after - not a rendering or
+  // BLE-stack overhead difference, just a slower interval). Rejecting keeps our own
+  // setConnectionParams(12, 12, ...) (15ms) in effect for the rest of the connection.
+  bool onConnParamsUpdateRequest(NimBLEClient* pClient, const ble_gap_upd_params* params) override {
+    Serial.printf("[BLE] Rejecting peer connection-param update request (itvl %u-%u x1.25ms) - keeping our fast interval\n",
+                  params->itvl_min, params->itvl_max);
+    return false;
   }
 } clientCallbacks;
 
@@ -650,9 +671,17 @@ void loop() {
 
       applyUiState(modeToUiState(opMode), watts);
 
-      lv_chart_set_next_value(chart_history, series_temp, (lv_coord_t)liveTemp);
-      // Real scrolling history, not a flat line at the current value - see file header.
-      lv_chart_set_next_value(chart_history, series_setpoint_ref, (lv_coord_t)setpoint);
+      // Decoupled from the label updates above, 2026-07-13: the chart redraw is the
+      // expensive part of every full-poll cycle (see HISTORY_POINTS comment) - pushing to
+      // it less often than the labels update keeps that cost off most cycles, freeing
+      // loop() to run the fast tip-only poll far more often in between.
+      static uint32_t lastChartPush = 0;
+      if (millis() - lastChartPush >= CHART_PUSH_INTERVAL_MS) {
+        lastChartPush = millis();
+        lv_chart_set_next_value(chart_history, series_temp, (lv_coord_t)liveTemp);
+        // Real scrolling history, not a flat line at the current value - see file header.
+        lv_chart_set_next_value(chart_history, series_setpoint_ref, (lv_coord_t)setpoint);
+      }
     } else {
       Serial.println("[BLE] Read failed on one or more characteristics");
     }

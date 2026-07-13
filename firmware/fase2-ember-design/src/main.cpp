@@ -42,6 +42,9 @@
 using fs::FS;
 using fs::File;
 #include <WiFiManager.h>
+#include <ArduinoOTA.h>
+#include <ESPmDNS.h>
+#include <Preferences.h>
 #include <esp_system.h>
 #include <lvgl.h>
 #include <time.h>
@@ -194,6 +197,32 @@ static const uint32_t WIFI_RETRY_INTERVAL_MS = 120000; // 2 min - also used as t
 static String g_wifiSsid;
 static String g_wifiPsk;
 
+// Timezone (2026-07-13) - was hardcoded to Copenhagen's POSIX TZ string, silently wrong for
+// anyone flashing this outside CET/CEST (a real gap, since this project now ships prebuilt
+// binaries for anyone - see README.md). Configurable via the same WiFi captive portal,
+// persisted in NVS via Preferences - same pattern a sibling project (TDAI-2170) uses for its
+// own portal-collected settings (MQTT host/user/pass).
+static const char*      DEFAULT_TZ = "CET-1CEST,M3.5.0,M10.5.0/3"; // Copenhagen - this project's own default
+static String            g_timezone = DEFAULT_TZ;
+static Preferences        prefs;
+static WiFiManagerParameter* pTzParam = nullptr; // registered in setup(), read in onWifiConfigSaved()
+
+// Fires when the portal's form is submitted (WiFiManager's own save-config hook) -
+// independent of whether the WiFi connect attempt that follows succeeds, so this also
+// captures the timezone on a portal session that's only being used to switch networks.
+// Blank input is treated as "leave unchanged" (matches TDAI's own optional-field pattern),
+// not "reset to default" - the field is always pre-filled with the current value anyway,
+// so blank only happens if the user deliberately clears it.
+static void onWifiConfigSaved() {
+  if (pTzParam && strlen(pTzParam->getValue()) > 0) {
+    g_timezone = pTzParam->getValue();
+    prefs.begin("pinecyd", false);
+    prefs.putString("tz", g_timezone);
+    prefs.end();
+    Serial.printf("[WiFi] Timezone saved: %s\n", g_timezone.c_str());
+  }
+}
+
 // GPIO0 is this board's BOOT button (also used for entering flash mode, but freely readable
 // at runtime afterwards - confirmed not to collide with any TFT pin in platformio.ini).
 // Holding it down through boot forces a fresh WiFi config portal even if a stored network
@@ -234,6 +263,50 @@ static void connectWifiNow() {
   } else {
     wm.autoConnect(WIFI_AP_NAME);
   }
+}
+
+// --- OTA updates over WiFi (2026-07-13) ---
+// Added so a firmware update doesn't require USB - `pio run -e ota -t upload` (see
+// platformio.ini) pushes a build to pinecyd.local over the network instead. Needs the
+// two-slot partition table (partitions_ota.csv, see platformio.ini) - huge_app.csv's single
+// "ota_0"-labeled slot could not have safely supported this (see that file's own comment).
+static const char* OTA_HOSTNAME = "pinecyd";
+// Same-LAN-only credential, not a secret worth a NVS/portal flow over - matches a sibling
+// project's (TDAI-2170) own established pattern of a hardcoded, overridable default rather
+// than plumbing this through the WiFi captive portal too. Override per-build with
+// `-D OTA_PASSWORD=\"...\"` if you want your own.
+#ifndef OTA_PASSWORD
+#define OTA_PASSWORD "pinecyd-ota"
+#endif
+
+static bool otaStarted    = false;
+static bool otaInProgress = false; // gates the WiFi on/off toggle in loop() - see there
+
+static void otaBegin() {
+  if (otaStarted) return;
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  ArduinoOTA.setHostname(OTA_HOSTNAME);
+  ArduinoOTA.setPassword(OTA_PASSWORD);
+
+  ArduinoOTA.onStart([]() {
+    otaInProgress = true;
+    Serial.println("[OTA] Update starting");
+  });
+  ArduinoOTA.onEnd([]() {
+    Serial.println("[OTA] Update complete, rebooting");
+  });
+  ArduinoOTA.onProgress([](unsigned int done, unsigned int total) {
+    Serial.printf("[OTA] %u%%\r", total ? (done * 100 / total) : 0);
+  });
+  ArduinoOTA.onError([](ota_error_t err) {
+    otaInProgress = false; // upload aborted - let the WiFi on/off toggle resume normally
+    Serial.printf("[OTA] Error %u\n", err);
+  });
+
+  ArduinoOTA.begin();
+  otaStarted = true;
+  Serial.printf("[OTA] Ready: %s.local (espota), hostname=%s\n", OTA_HOSTNAME, OTA_HOSTNAME);
 }
 
 static const char* resetReasonToStr(esp_reset_reason_t r) {
@@ -630,6 +703,14 @@ void setup() {
   wm.setConnectTimeout(WIFI_CONNECT_TIMEOUT_S);
   wm.setConfigPortalTimeout(WIFI_RETRY_INTERVAL_MS / 1000);
   wm.setAPCallback(onConfigPortalStart);
+  wm.setSaveConfigCallback(onWifiConfigSaved);
+
+  prefs.begin("pinecyd", true);
+  g_timezone = prefs.getString("tz", DEFAULT_TZ);
+  prefs.end();
+  static WiFiManagerParameter tzParam("tz", "Timezone (POSIX TZ string)", g_timezone.c_str(), 63);
+  pTzParam = &tzParam;
+  wm.addParameter(&tzParam);
 
   if (bootButtonHeld) {
     Serial.println("[BOOT] BOOT button held at boot - resetting stored WiFi config and forcing the portal");
@@ -676,7 +757,12 @@ void loop() {
   // thing that needs it. At the user's suggestion, 2026-07-13.
   static uint32_t lastWifiAttempt = 0; // shared with the retry block below
   bool            shouldShowClock = !connected;
-  if (shouldShowClock != clockScreenActive) {
+  // If a Pinecil connects while an OTA transfer is actively in progress, defer turning WiFi
+  // off (and the screen switch) until the transfer finishes - yanking WiFi mid-flash would
+  // corrupt the update. The "turn WiFi back on" direction never needs this guard since it
+  // doesn't touch WiFi.mode(WIFI_OFF).
+  bool wifiOffWouldInterruptOta = (!shouldShowClock && otaInProgress);
+  if (shouldShowClock != clockScreenActive && !wifiOffWouldInterruptOta) {
     clockScreenActive = shouldShowClock;
     lv_scr_load(clockScreenActive ? scr_clock : scr_dashboard);
     if (clockScreenActive) {
@@ -688,6 +774,9 @@ void loop() {
       // Don't leave the AP+webserver running while intentionally powering the radio off.
       if (wm.getConfigPortalActive()) wm.stopConfigPortal();
       wifiConfigActive = false;
+      MDNS.end();
+      otaStarted = false; // ArduinoOTA's listener doesn't survive a WiFi power-cycle -
+                          // otaBegin() re-runs fresh next time WiFi reconnects (see below)
       WiFi.disconnect(true);
       WiFi.mode(WIFI_OFF);
     }
@@ -698,6 +787,7 @@ void loop() {
   // once the portal closes (saved successfully, or its own timeout - see setup()).
   if (clockScreenActive) {
     wm.process();
+    if (otaStarted) ArduinoOTA.handle();
 
     // onConfigPortalStart()'s stop() call is a single synchronous attempt made right as
     // WiFi switches into AP_STA mode - confirmed live, 2026-07-13, that NimBLE's host task
@@ -728,7 +818,11 @@ void loop() {
   bool        wifiNowConnected = (WiFi.status() == WL_CONNECTED);
   if (wifiNowConnected && !wifiWasConnected) {
     Serial.printf("[WiFi] Connected, IP=%s - configuring NTP\n", WiFi.localIP().toString().c_str());
-    configTzTime("CET-1CEST,M3.5.0,M10.5.0/3", "pool.ntp.org", "time.google.com");
+    configTzTime(g_timezone.c_str(), "pool.ntp.org", "time.google.com");
+    if (MDNS.begin(OTA_HOSTNAME)) {
+      Serial.printf("[WiFi] mDNS ready: http://%s.local/\n", OTA_HOSTNAME);
+    }
+    otaBegin();
     if (g_wifiSsid.isEmpty()) {
       g_wifiSsid = WiFi.SSID();
       g_wifiPsk  = WiFi.psk();

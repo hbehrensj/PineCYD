@@ -207,13 +207,63 @@ unattended device. PineCYD sits on a desk where the user would see the portal ap
 the tradeoff was judged acceptable here - but it's a real divergence from the other
 project's hard-won lesson, not an oversight.
 
+**Timezone is configurable via the same portal (2026-07-13), not hardcoded.** The clock
+NTP config was originally a hardcoded Copenhagen POSIX TZ string (`CET-1CEST,M3.5.0,
+M10.5.0/3`) - silently wrong for anyone outside CET/CEST, a real gap once this project
+started shipping prebuilt binaries for anyone to flash (see "Flashing a release" in the
+top-level README). Fixed by adding a `WiFiManagerParameter` text field ("Timezone (POSIX TZ
+string)") to the portal, pre-filled with the current value and persisted via `Preferences`
+(NVS) on save - same pattern TDAI-2170 uses for its own portal-collected settings (MQTT
+host/user/pass). Defaults to the Copenhagen string for a first-time setup; enter your own
+POSIX TZ string (the same format as the Linux `TZ` environment variable) if you're
+elsewhere. **Not yet verified live** - the device went offline (USB/power disconnected)
+right after this shipped, before a real-hardware check of a non-default timezone.
+
+### OTA updates over WiFi (2026-07-13)
+
+Added so ongoing firmware updates don't need a USB cable: `pio run -e ota -t upload` (see
+`platformio.ini`'s `[env:ota]`) pushes a build to `pinecyd.local` via `ArduinoOTA` instead of
+a serial port. **Needed a real partition-table change first** - `huge_app.csv` (previously
+used) labels its single 3MB app partition `ota_0`, which looks OTA-capable but isn't: with
+no second slot, `esp_ota_get_next_update_partition()` has nothing to return except the
+partition the code is currently executing from, and you cannot safely overwrite that while
+it's running (code execution reads through the flash cache/MMU - erasing the region backing
+it out from under itself would corrupt the running program, not update it safely). Switched
+to a custom `partitions_ota.csv` with two real ~1.875MiB `ota_0`/`ota_1` slots instead (see
+that file's own header comment for the exact layout) - the current image (~1.7MB, 86% of a
+slot) fits with real but tighter headroom than `huge_app.csv`'s old 53%-of-3MB.
+
+**This partition-table change itself needed one more USB flash** to take effect (the
+bootloader and partition table can't be rewritten by an app-only OTA push) - full merged
+`firmware.factory.bin` flashed once at offset `0x0`, confirmed the board still booted and
+ran identically afterward (BLE dashboard, heap, WiFi toggle all unaffected). From that point
+on, `pio run -e ota -t upload` works with no USB involved - **confirmed end-to-end on real
+hardware**: pushed a build over WiFi, watched it authenticate, transfer, and the board
+reboot automatically into the new firmware, dashboard fully functional afterward.
+
+**A Pinecil connecting mid-OTA-transfer is guarded against**: the existing WiFi on/off
+toggle (WiFi off once a Pinecil connects, to save heap/reduce radio contention - see above)
+would otherwise yank WiFi out from under an in-progress flash. `ArduinoOTA`'s
+`onStart`/`onError` callbacks set/clear an `otaInProgress` flag that defers the "turn WiFi
+off" transition (not the reverse "turn WiFi back on" direction, which never touches WiFi.OFF
+and needs no guard) until the transfer finishes. `otaStarted` also resets on every WiFi-off
+transition, since `ArduinoOTA`'s listener doesn't survive a WiFi power-cycle - it's
+re-initialized fresh on each reconnect (alongside mDNS, which is restarted the same way).
+
+**OTA password is a hardcoded, overridable default** (`pinecyd-ota`, override at build time
+with `-D OTA_PASSWORD=\"...\"`), not plumbed through the portal/NVS like WiFi credentials or
+the timezone - matches TDAI-2170's own established judgment that this class of same-LAN-only
+credential doesn't need that treatment.
+
 **Measured cost, real hardware:**
 - Free heap: ~155KB (BLE+LVGL alone) → **~71-72KB with WiFi connected** (continuous) →
   **~107KB once WiFi is turned off again** after a Pinecil connects (some of WiFi's ~83KB
-  cost doesn't fully release even with `WIFI_OFF` - not yet root-caused further).
-- Had to switch `board_build.partitions` to `huge_app.csv` (3MB single app partition, no
-  OTA/spiffs) - the default ~1.31MB app partition couldn't fit the image at all once WiFi
-  was linked in (needed ~1.51MB).
+  cost doesn't fully release even with `WIFI_OFF` - not yet root-caused further). Adding
+  ArduinoOTA/ESPmDNS/Preferences on top of WiFiManager cost a further few KB of both flash
+  and heap - modest, but real; see the partition-table note above for the flash-side impact.
+- ~~Had to switch `board_build.partitions` to `huge_app.csv` (3MB single app partition, no
+  OTA/spiffs)~~ - superseded by `partitions_ota.csv` above, once real OTA needed a genuine
+  second slot.
 - BLE poll `cycle_ms` got noticeably slower and more variable with WiFi continuously on
   (557-1111ms vs. a steady ~554-663ms without it) - a direct, measurable sign of ESP32
   WiFi/BT radio coexistence contention. **The ~554-663ms itself is not a WiFi cost** -

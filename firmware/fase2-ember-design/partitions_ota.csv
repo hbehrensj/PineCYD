@@ -1,0 +1,21 @@
+# PineCYD custom partition table - two real OTA app slots (ota_0/ota_1), 2026-07-13.
+#
+# huge_app.csv (previously used) labels its single app partition "ota_0" but defines no
+# ota_1 - esp_ota_get_next_update_partition() falls back to returning that SAME partition
+# when only one OTA slot exists, meaning an OTA write would target the flash region the
+# code is currently executing from via the cache/MMU. That's not a safe update path, just a
+# partition subtype name that looks OTA-capable without actually being it - confirmed by
+# reasoning through esp_ota_ops.c's partition-selection logic, not by testing it (no reason
+# to risk bricking real hardware to confirm a bad idea).
+#
+# Each slot is 0x1E0000 (1,966,080 bytes / ~1.875MiB) - current image is ~1.67MB, leaving
+# ~300KB headroom for growth. No spiffs partition (this project has never needed a
+# filesystem); a small coredump partition is kept for crash diagnostics, matching this
+# project's existing addr2line-based panic-decoding habit.
+#
+# Name,     Type, SubType, Offset,   Size,     Flags
+nvs,        data, nvs,     0x9000,   0x5000,
+otadata,    data, ota,     0xe000,   0x2000,
+app0,       app,  ota_0,   0x10000,  0x1E0000,
+app1,       app,  ota_1,   0x1F0000, 0x1E0000,
+coredump,   data, coredump,0x3D0000, 0x10000,

@@ -52,6 +52,15 @@ found and fixed on real hardware.
   portal's access point couldn't be joined at all (confirmed on both iOS and macOS) while
   this project's continuous BLE scan was left running - fixed by pausing the scan for as
   long as the portal is open. See the firmware README for the full root-cause writeup.
+- **A partition subtype name isn't the same as working OTA support.** `huge_app.csv`
+  labels its single 3MB app partition `ota_0`, but with no second slot to write into,
+  there's no safe way to flash a new image without overwriting the code that's currently
+  executing. Real OTA needed a genuine two-slot partition table - see the firmware README.
+- **A bare `platform = espressif32` in `platformio.ini` isn't reproducible across
+  machines.** Every real-hardware test in this project quietly ran on a different fork
+  (pioarduino) than a fresh CI environment resolved by default - now pinned explicitly.
+- **The clock's timezone was hardcoded** (Copenhagen) until a user in another timezone
+  would have seen the wrong time - now configurable via the same WiFi setup portal.
 
 ## Building
 
@@ -64,6 +73,16 @@ pio run -t upload
 No compile-time WiFi credentials needed - on first boot the CYD opens its own
 `PineCYD-Setup` WiFi network with a captive config portal (see the firmware's own README
 for the full setup flow, cadence, and the BOOT-button reset).
+
+**After that first USB flash, updates can go over WiFi** - no cable needed:
+
+```sh
+pio run -e ota -t upload
+```
+
+Pushes a build to the board at `pinecyd.local` via `ArduinoOTA`. See the firmware README's
+"OTA updates over WiFi" section for how this works and why it needed a partition-table
+change first.
 
 ## Flashing a release
 
@@ -84,7 +103,9 @@ esptool.py --chip esp32 --port /dev/ttyUSB0 write_flash 0x0 pinecyd-firmware-fac
 
 (Use your board's actual serial port - e.g. `/dev/cu.usbserial-XXXX` on macOS, `COM3` on
 Windows.) First boot opens the `PineCYD-Setup` WiFi network to configure your own network -
-see "No compile-time WiFi credentials needed" above.
+see "No compile-time WiFi credentials needed" above. This is the only USB flash needed -
+every release binary already includes OTA support, so future updates can go over WiFi (see
+"Building" above).
 
 ## Layout
 

@@ -67,12 +67,11 @@ static const char* CHAR_OP_MODE       = "d85ef00D-168e-4a71-aa55-33e27f9bc533"; 
 static const char* CHAR_EST_WATTS     = "d85ef00E-168e-4a71-aa55-33e27f9bc533"; // uint32 LE, decwatts (IronOS: x10WattHistory)
 static const char* SERVICE_BULK_DATA  = "9eae1000-9d0d-48c5-aa55-33e27f9bc533"; // scan filter only
 
-static const uint32_t POLL_INTERVAL_MS = 500; // full cycle: all 6 characteristics, chart+labels
-// Tip temp read on its own, much faster, in between full cycles - at the user's
-// suggestion, 2026-07-13: reading only 1 characteristic instead of 6 cuts the per-read
-// round trip (each ~90-100ms) out of the critical path for the number that actually needs
-// to feel responsive while soldering. 50ms is below the real read latency floor, so the
-// achieved rate is bounded by that floor (~90-100ms, ~10Hz), not by this constant.
+// Every cycle reads tip_temp plus one of the other five characteristics in round-robin
+// (see loop()) - not a fixed 6-read burst. 50ms is below the real read latency floor
+// (~20-45ms/read once the connection-interval fix - see README.md - keeps the fast
+// interval from being renegotiated away), so the achieved cycle rate is bounded by that
+// floor, not by this constant.
 static const uint32_t TIP_POLL_INTERVAL_MS = 50;
 
 // IronOS OperatingMode enum values that matter here (confirmed from
@@ -476,9 +475,9 @@ static bool connectToPinecil() {
   }
 
   // label_mode is left as-is here ("SCANNING..." or a stale mode/temp from before a prior
-  // disconnect) - the very next poll cycle's applyUiState() call sets it to the real mode
-  // within POLL_INTERVAL_MS (500ms), and a real tip temp appearing is itself the connected
-  // signal now (see file header) - no need to also flip this label immediately here.
+  // disconnect) - the mode label only reflects the real mode once its own turn comes up in
+  // the round-robin cycle (see loop()), and a real tip temp appearing is itself the
+  // connected signal now (see file header) - no need to also flip this label immediately here.
   connected = true;
   return true;
 }
@@ -603,87 +602,103 @@ void loop() {
     }
   }
 
-  // Fast tip-only poll (see TIP_POLL_INTERVAL_MS) - just the number, not the chart (the
-  // chart still advances only on the full cycle below, so its "LAST 2 MIN" timing/HISTORY_
-  // POINTS assumption and the setpoint-reference series stay in lockstep; pushing tip
-  // faster than that would desync the two series visually).
-  static uint32_t lastTipPoll = 0;
-  if (connected && pChrLiveTemp && millis() - lastTipPoll >= TIP_POLL_INTERVAL_MS) {
-    lastTipPoll = millis();
+  // Poll cycle: tip_temp every time, plus exactly one of the other five characteristics
+  // in round-robin, instead of a fast tip-only poll alongside a periodic 6-read "full"
+  // burst. At the user's suggestion, 2026-07-13: the full-cycle burst (even after
+  // connection-interval and chart-cost fixes - see README.md) was still visible as a
+  // periodic stutter in an otherwise-smooth tip-temp update rate, since it briefly
+  // monopolized the connection for 5 extra reads every cycle. Spreading those 5 reads one
+  // at a time across five consecutive cycles keeps every cycle roughly the same size (two
+  // reads), so there's no more periodic burst to stutter on. The five secondary values are
+  // individually a bit slower to refresh now (~5 cycles apart instead of every cycle), but
+  // none of them need tip-temp's responsiveness.
+  enum SecondaryChar { SEC_SETPOINT, SEC_DC_INPUT, SEC_HANDLE_TEMP, SEC_OP_MODE, SEC_EST_WATTS, SEC_COUNT };
+  static uint32_t lastCycle    = 0;
+  static int      secIdx       = 0;
+  static uint32_t g_setpoint   = 0;
+  static uint32_t g_dcInputDv  = 0;
+  static uint32_t g_handleTemp = 0;
+  static uint32_t g_opMode     = 0;
+  static uint32_t g_estWattsDw = 0;
+  bool haveAllChars = pChrLiveTemp && pChrSetpoint && pChrDcInput && pChrHandleTemp && pChrOpMode && pChrEstWatts;
+
+  if (connected && haveAllChars && millis() - lastCycle >= TIP_POLL_INTERVAL_MS) {
+    lastCycle = millis();
+
     uint32_t t0 = micros();
     bool     okTip;
-    uint32_t liveTemp  = readU32LE(pChrLiveTemp, okTip);
-    uint32_t tipCycleUs = micros() - t0;
+    uint32_t liveTemp = readU32LE(pChrLiveTemp, okTip);
+
+    NimBLERemoteCharacteristic* secChr = nullptr;
+    switch (secIdx) {
+      case SEC_SETPOINT:    secChr = pChrSetpoint; break;
+      case SEC_DC_INPUT:    secChr = pChrDcInput; break;
+      case SEC_HANDLE_TEMP: secChr = pChrHandleTemp; break;
+      case SEC_OP_MODE:     secChr = pChrOpMode; break;
+      case SEC_EST_WATTS:   secChr = pChrEstWatts; break;
+    }
+    bool     okSec;
+    uint32_t secVal  = readU32LE(secChr, okSec);
+    uint32_t cycleUs = micros() - t0;
+
     if (okTip) {
       lv_label_set_text_fmt(label_tip_value, "%lu", liveTemp);
-      Serial.printf("%lu,tip_only_temp=%lu,cycle_ms=%.1f\n", millis(), liveTemp, tipCycleUs / 1000.0);
     }
-  }
-
-  static uint32_t lastPoll = 0;
-  bool haveAllChars = pChrLiveTemp && pChrSetpoint && pChrDcInput && pChrHandleTemp && pChrOpMode && pChrEstWatts;
-  if (connected && haveAllChars && millis() - lastPoll >= POLL_INTERVAL_MS) {
-    lastPoll = millis();
-
-    uint32_t t0 = micros();
-    bool ok1, ok2, ok3, ok4, ok5, ok6;
-    uint32_t liveTemp   = readU32LE(pChrLiveTemp, ok1);
-    uint32_t setpoint   = readU32LE(pChrSetpoint, ok2);
-    uint32_t dcInputDv  = readU32LE(pChrDcInput, ok3);
-    uint32_t handleTemp = readU32LE(pChrHandleTemp, ok4);
-    uint32_t opMode     = readU32LE(pChrOpMode, ok5);
-    uint32_t estWattsDw = readU32LE(pChrEstWatts, ok6); // decwatts (x10)
-    uint32_t cycleUs    = micros() - t0;
-
-    if (ok1 && ok2 && ok3 && ok4 && ok5 && ok6) {
-      float watts    = estWattsDw / 10.0f;
-      float wattsPct = (watts / ASSUMED_MAX_WATTS) * 100.0f;
-      if (wattsPct > 100.0f) wattsPct = 100.0f;
-      if (wattsPct < 0.0f) wattsPct = 0.0f;
-
-      Serial.printf("%lu,live_temp=%lu,setpoint=%lu,dc_input_dv=%lu,handle_temp=%lu,op_mode=%lu,est_watts_dw=%lu,cycle_ms=%.1f,"
-                    "heap=%u,min_heap=%u\n",
-                    millis(), liveTemp, setpoint, dcInputDv, handleTemp, opMode, estWattsDw, cycleUs / 1000.0, ESP.getFreeHeap(),
-                    ESP.getMinFreeHeap());
-
-      // lv_label_set_text_fmt() goes through LVGL's own lightweight snprintf, which has
-      // LV_SPRINTF_USE_FLOAT=0 by default (confirmed in lv_conf.h) - %f silently produces
-      // garbage ("fW", a missing-glyph box, "fV" - seen live on real hardware, 2026-07-13).
-      // Serial.printf() above is unaffected (that's the real newlib printf) - only LVGL
-      // label text is. Fixed by formatting watts/volts as separate integer parts instead.
-      uint32_t wattsWhole  = (estWattsDw + 5) / 10; // decwatts -> whole watts, rounded
-      uint32_t voltsWhole  = dcInputDv / 10;
-      uint32_t voltsTenths = dcInputDv % 10;
-      // Also empirically corrected, 2026-07-13: IronOS's current source
-      // (BSP.cpp's NTCHandleLookup table) claims getHandleTemperature() returns plain
-      // degC, but real hardware reported handle_temp=406-411 while actively soldering -
-      // physically impossible for a handle (would mean the plastic is melting), and
-      // exactly plausible as 40.6-41.1 C if this value is actually x10-scaled on this
-      // iron's actual firmware version (which may differ from IronOS's current source).
-      // Trusting the live reading's physical plausibility over the source comment.
-      uint32_t handleTempC = handleTemp / 10;
-
-      lv_label_set_text_fmt(label_tip_value, "%lu", liveTemp);
-      lv_label_set_text_fmt(label_setpoint_value, "%lu\xC2\xB0", setpoint);
-      lv_label_set_text_fmt(label_power, "%luW \xE2\x80\xA2 %lu.%luV", wattsWhole, voltsWhole, voltsTenths);
-      lv_label_set_text_fmt(label_handle, "HANDLE %lu\xC2\xB0" "C", handleTempC);
-      lv_bar_set_value(bar_power, (int32_t)wattsPct, LV_ANIM_OFF);
-
-      applyUiState(modeToUiState(opMode), watts);
-
-      // Decoupled from the label updates above, 2026-07-13: the chart redraw is the
-      // expensive part of every full-poll cycle (see HISTORY_POINTS comment) - pushing to
-      // it less often than the labels update keeps that cost off most cycles, freeing
-      // loop() to run the fast tip-only poll far more often in between.
-      static uint32_t lastChartPush = 0;
-      if (millis() - lastChartPush >= CHART_PUSH_INTERVAL_MS) {
-        lastChartPush = millis();
-        lv_chart_set_next_value(chart_history, series_temp, (lv_coord_t)liveTemp);
-        // Real scrolling history, not a flat line at the current value - see file header.
-        lv_chart_set_next_value(chart_history, series_setpoint_ref, (lv_coord_t)setpoint);
+    if (okSec) {
+      switch (secIdx) {
+        case SEC_SETPOINT:    g_setpoint   = secVal; break;
+        case SEC_DC_INPUT:    g_dcInputDv  = secVal; break;
+        case SEC_HANDLE_TEMP: g_handleTemp = secVal; break;
+        case SEC_OP_MODE:     g_opMode     = secVal; break;
+        case SEC_EST_WATTS:   g_estWattsDw = secVal; break;
       }
-    } else {
-      Serial.println("[BLE] Read failed on one or more characteristics");
+    }
+    Serial.printf("%lu,live_temp=%lu,secondary_idx=%d,secondary_val=%lu,cycle_ms=%.1f,heap=%u\n", millis(), liveTemp, secIdx,
+                  secVal, cycleUs / 1000.0, ESP.getFreeHeap());
+    secIdx = (secIdx + 1) % SEC_COUNT;
+
+    // Re-render the derived labels every cycle from the cached values above (cheap - no
+    // BLE cost, just formatting), even though only one of them was freshly read this
+    // cycle - keeps the dashboard internally consistent regardless of which value is
+    // "newest" at any given moment.
+    float watts    = g_estWattsDw / 10.0f;
+    float wattsPct = (watts / ASSUMED_MAX_WATTS) * 100.0f;
+    if (wattsPct > 100.0f) wattsPct = 100.0f;
+    if (wattsPct < 0.0f) wattsPct = 0.0f;
+
+    // lv_label_set_text_fmt() goes through LVGL's own lightweight snprintf, which has
+    // LV_SPRINTF_USE_FLOAT=0 by default (confirmed in lv_conf.h) - %f silently produces
+    // garbage ("fW", a missing-glyph box, "fV" - seen live on real hardware, 2026-07-13).
+    // Serial.printf() above is unaffected (that's the real newlib printf) - only LVGL
+    // label text is. Fixed by formatting watts/volts as separate integer parts instead.
+    uint32_t wattsWhole  = (g_estWattsDw + 5) / 10; // decwatts -> whole watts, rounded
+    uint32_t voltsWhole  = g_dcInputDv / 10;
+    uint32_t voltsTenths = g_dcInputDv % 10;
+    // Also empirically corrected, 2026-07-13: IronOS's current source
+    // (BSP.cpp's NTCHandleLookup table) claims getHandleTemperature() returns plain
+    // degC, but real hardware reported handle_temp=406-411 while actively soldering -
+    // physically impossible for a handle (would mean the plastic is melting), and
+    // exactly plausible as 40.6-41.1 C if this value is actually x10-scaled on this
+    // iron's actual firmware version (which may differ from IronOS's current source).
+    // Trusting the live reading's physical plausibility over the source comment.
+    uint32_t handleTempC = g_handleTemp / 10;
+
+    lv_label_set_text_fmt(label_setpoint_value, "%lu\xC2\xB0", g_setpoint);
+    lv_label_set_text_fmt(label_power, "%luW \xE2\x80\xA2 %lu.%luV", wattsWhole, voltsWhole, voltsTenths);
+    lv_label_set_text_fmt(label_handle, "HANDLE %lu\xC2\xB0" "C", handleTempC);
+    lv_bar_set_value(bar_power, (int32_t)wattsPct, LV_ANIM_OFF);
+
+    applyUiState(modeToUiState(g_opMode), watts);
+
+    // Decoupled from the per-cycle reads above, 2026-07-13: the chart redraw is the
+    // expensive part of any cycle that touches it - pushing to it much less often than
+    // the labels update keeps that cost off most cycles.
+    static uint32_t lastChartPush = 0;
+    if (okTip && millis() - lastChartPush >= CHART_PUSH_INTERVAL_MS) {
+      lastChartPush = millis();
+      lv_chart_set_next_value(chart_history, series_temp, (lv_coord_t)liveTemp);
+      // Real scrolling history, not a flat line at the current value - see file header.
+      lv_chart_set_next_value(chart_history, series_setpoint_ref, (lv_coord_t)g_setpoint);
     }
   }
 

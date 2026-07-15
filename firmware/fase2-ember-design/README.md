@@ -357,49 +357,65 @@ timezone are already configured. Real, accepted risks worth restating plainly:
 - HTTPS uses `WiFiClientSecure::setInsecure()` (no certificate pinning), matching this
   project's OTA self-update precedent - acceptable for a hobby device, but worth knowing.
 
-**Verified on real hardware, 2026-07-15 - layout confirmed, but the fetch itself is not
-reliable yet.** The clock/date/usage-zone stack fits and renders correctly (including the
-Danish "søn"/"lør" weekday abbreviations - the missing-glyph risk flagged earlier turned out
-fine). The settings page (below) works. But the actual HTTPS fetch has a real, reproducible
-reliability problem:
+**Verified working end-to-end on real hardware, 2026-07-15**, including a real token and
+real data rendering on screen. Getting there took a real diagnostic journey:
 
-**The TLS handshake to `api.anthropic.com` frequently fails with a memory allocation
+**The TLS handshake to `api.anthropic.com` initially failed with a memory allocation
 error** (`X509 - Allocation of memory failed` / `BIGNUM - Memory allocation failed`), and
-`ESP.getMinFreeHeap()` was observed dropping as low as **5.7-5.9KB**. This is not "too
-little total free memory" - the board typically reports 50KB+ free at the same moment - it's
-**heap fragmentation**: a TLS handshake needs a large *contiguous* block (mbedTLS's
+`ESP.getMinFreeHeap()` was observed dropping as low as **5.7-5.9KB**. Not "too little total
+free memory" - the board typically reported 50KB+ free at the same moment - **heap
+fragmentation**: a TLS handshake needs a large *contiguous* block (mbedTLS's
 `MBEDTLS_SSL_IN_CONTENT_LEN`/`MBEDTLS_SSL_OUT_CONTENT_LEN` default to 16KB each, 32KB total,
 compiled into the prebuilt framework library - `NetworkClientSecure` on this core has no
-runtime `setBufferSizes()` to shrink them, unlike older ESP32 Arduino cores), and running
-BLE+LVGL+WiFiManager+ArduinoOTA+mDNS+a settings WebServer all concurrently on a no-PSRAM
-board leaves the heap fragmented enough that a block that size often isn't available.
+runtime `setBufferSizes()`, unlike older ESP32 Arduino cores, and `MBEDTLS_SSL_VARIABLE_
+BUFFER_LENGTH` - the flag that would let the buffer shrink to match a negotiated smaller TLS
+fragment size - was confirmed absent from the actual compiled `sdkconfig.h`, so the 32KB
+figure is a hard, fixed property of this framework build, not reducible from application
+code without rebuilding ESP-IDF from source).
 
-Two hypotheses were tested and **disproved**:
+Two hypotheses were tested and **disproved** (kept as a record so they're not re-tried):
 - *Reduced BLE scan duty cycle* (thinking it was the same WiFi-starved-by-BLE contention
   that made the captive portal unjoinable, see above) - no effect on the failure rate.
 - *Keeping WiFi on continuously instead of toggling it off while a Pinecil is connected*
   (thinking repeated init/teardown of mDNS/OTA/the settings server was fragmenting the
   heap) - **also no effect**: `min_heap` still collapsed to ~5.7KB with WiFi never once
-  power-cycled. This also cost real BLE latency (`cycle_ms` ~49-137ms, averaging
-  noticeably worse than the ~54-70ms this project normally achieves) for zero benefit, so
-  the WiFi on/off toggle was reverted back to its original behavior.
+  power-cycled. This also cost real BLE latency (`cycle_ms` ~49-137ms vs. the normal
+  ~54-70ms) for zero benefit, so the WiFi on/off toggle was reverted to its original
+  behavior.
 
-One real fix was found and confirmed: the fetch used to also run *eagerly* on every WiFi
-(re)connect, right in the middle of `otaBegin()`/`settingsServerBegin()`/mDNS all
-initializing at once - the worst possible moment for a 32KB allocation. Removing that eager
-call, and reducing `USAGE_FETCH_INTERVAL_MS` from 60s to 5 minutes (fewer attempts at the
-risky operation, not smaller peak memory need), meaningfully improved things but did **not**
-eliminate the failures - a fetch triggered well after boot, with a healthy ~50KB heap
-reported, still failed the same way.
+**What actually fixed it - not shrinking the 32KB requirement (confirmed not possible from
+application code), but making a large enough contiguous block reliably available:**
+- **`LV_MEM_SIZE` cut from 40KB to 20KB**, based on measurement, not another guess:
+  `lv_mem_monitor()` on real hardware (all three screens built) showed only ~13KB actually
+  used. The original 40KB was never measured, just a round-number guess. Freed ~20KB back
+  to the general heap with ~7KB of real headroom still spare.
+- **The BLE scan is now paused for the duration of each fetch attempt** (same trick already
+  proven for the captive portal), freeing whatever headroom its own buffers were holding
+  right when it matters, and resumed immediately after.
+- **A fast-fail check** via `heap_caps_get_largest_free_block()` before even attempting the
+  connection - if there isn't a ~36KB contiguous block available, skip the attempt entirely
+  (logging why) instead of blocking on a doomed multi-second connect timeout.
+- The earlier eager-fetch-on-connect removal and the 60s->5min interval reduction (see
+  git history) were real, kept improvements too, just not sufficient alone.
+- **A second, unrelated bug surfaced once the memory issue cleared**: `deserializeJson()`
+  reading directly from `http.getStream()` failed with `InvalidInput` even after a
+  successful `HTTP 200` - cause not fully root-caused, worked around by buffering the
+  response into a `String` via `http.getString()` first and parsing that instead (the
+  response is only a few hundred bytes, buffering it costs nothing meaningful).
 
-**Conclusion: the fragmentation appears structural** to this exact combination of libraries
-on a no-PSRAM ESP32, not something fixable by sequencing/timing changes alone. The
-originally-offered, user-declined alternative - a small bridge script on a trusted machine
-holding the token and serving only sanitized percentages, so the device never does TLS at
-all - remains the most promising path if full reliability is wanted. Left as-is for now
-(best-effort: succeeds when it can find a big enough contiguous block, shows "FORSINKET"
-when it can't) per the user's explicit choice to keep trying on-device rather than switch
-architectures tonight.
+Confirmed via repeated live testing: 4 consecutive fetch attempts all completed the TLS
+handshake successfully (`largest free contiguous block` stable around ~59-61KB, not
+degrading across repeated attempts), and a real token produced `[Usage] Fetched OK` with
+data rendering correctly on the physical screen.
+
+**Structural limits worth knowing, not eliminated, just made reliable enough:** the 32KB
+requirement itself is still real and fixed. If future changes to this firmware add more
+concurrent memory pressure, the failure could return - the fast-fail check means it'll fail
+*visibly and cheaply* (a log line, next retry in 5 min) rather than *silently and slowly*
+(a multi-second doomed connect attempt) if that happens. The originally-offered bridge-
+script alternative (a script on a trusted machine holds the token, device only polls plain-
+HTTP sanitized percentages, never does TLS at all) remains available as a fallback if this
+ever regresses.
 
 **Flash headroom is now genuinely tight**: ~94% of the 1.875MiB OTA slot (`partitions_ota.csv`)
 after adding ArduinoJson + HTTPClient + WiFiClientSecure on top of everything else - only

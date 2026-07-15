@@ -49,6 +49,7 @@ using fs::File;
 #include <WiFiClientSecure.h>
 #include <WebServer.h>
 #include <ArduinoJson.h>
+#include <esp_heap_caps.h>
 #include <esp_system.h>
 #include <lvgl.h>
 #include <time.h>
@@ -329,8 +330,16 @@ static const char* OTA_HOSTNAME = "pinecyd";
 #define OTA_PASSWORD "pinecyd-ota"
 #endif
 
-static bool otaStarted    = false;
-static bool otaInProgress = false; // gates the WiFi on/off toggle in loop() - see there
+static bool     otaStarted    = false;
+static bool     otaInProgress = false; // gates the WiFi on/off toggle in loop() - see there
+static uint32_t otaStartedAtMs = 0;
+// Bounded listening window, 2026-07-15: freeing ArduinoOTA's listener (and whatever
+// contiguous headroom it's holding) for the long tail of uptime - one more lever in the
+// same effort as fetchClaudeUsage()'s heap-fragmentation fight. A reboot re-opens it
+// (power-cycle or a fresh WiFi reconnect); no on-demand reopen UI built for this yet -
+// this project already has USB/console access as a fallback if OTA is needed outside the
+// window.
+static const uint32_t OTA_WINDOW_MS = 20 * 60 * 1000;
 
 static void otaBegin() {
   if (otaStarted) return;
@@ -338,6 +347,10 @@ static void otaBegin() {
 
   ArduinoOTA.setHostname(OTA_HOSTNAME);
   ArduinoOTA.setPassword(OTA_PASSWORD);
+  ArduinoOTA.setMdnsEnabled(false); // we manage mDNS ourselves (MDNS.begin()/end() tied to
+                                    // the WiFi toggle) - ArduinoOTA.end() would otherwise
+                                    // also tear down mDNS, breaking the settings page's
+                                    // pinecyd.local resolution whenever the OTA window closes
 
   ArduinoOTA.onStart([]() {
     otaInProgress = true;
@@ -355,8 +368,10 @@ static void otaBegin() {
   });
 
   ArduinoOTA.begin();
-  otaStarted = true;
-  Serial.printf("[OTA] Ready: %s.local (espota), hostname=%s\n", OTA_HOSTNAME, OTA_HOSTNAME);
+  otaStarted    = true;
+  otaStartedAtMs = millis();
+  Serial.printf("[OTA] Ready: %s.local (espota), hostname=%s - open for %lu min\n", OTA_HOSTNAME, OTA_HOSTNAME,
+                OTA_WINDOW_MS / 60000UL);
 }
 
 // --- Always-on settings page (2026-07-15) ---
@@ -495,6 +510,12 @@ static time_t parseIso8601Utc(const char* s) {
   return utcTmToEpoch(y, mo, d, h, mi, se);
 }
 
+// mbedTLS's SSL context needs a contiguous block around this size on this framework build
+// (16KB RX + 16KB TX, compile-time fixed - see fetchClaudeUsage()'s own comment for why
+// this can't be shrunk from application code). A small margin above the raw 32KB minimum,
+// since other allocations (HTTPClient/ArduinoJson's own buffers) ride alongside it.
+static const size_t USAGE_FETCH_MIN_CONTIGUOUS_HEAP = 36864;
+
 // Fetches usage and updates g_usageLines in place. Runs on its own schedule (see loop())
 // while WiFi is on; a failure just leaves the last-known values in place - staleness is
 // tracked separately via g_lastUsageFetchOkMs (last *successful* fetch), not fetch attempts,
@@ -507,10 +528,28 @@ static void fetchClaudeUsage() {
   // NetworkClientSecure has no setBufferSizes() here, unlike older ESP32 Arduino cores) are
   // a real problem on this no-PSRAM board once WiFiManager+OTA+mDNS+the settings webserver
   // are also resident: min_heap dropped to 5780 bytes and the handshake itself started
-  // failing ("X509 - Allocation of memory failed", HTTP -1/"connection refused"). Can't
-  // shrink the buffers without rebuilding ESP-IDF itself (out of scope tonight) - the lever
-  // actually available is frequency: USAGE_FETCH_INTERVAL_MS below controls how often this
-  // ~32KB-hungry handshake runs at all, which is what got tuned instead.
+  // failing ("X509 - Allocation of memory failed", HTTP -1/"connection refused"). Confirmed
+  // by inspecting the actual compiled sdkconfig.h that MBEDTLS_SSL_VARIABLE_BUFFER_LENGTH
+  // (the flag that would let the buffer shrink to match a negotiated smaller TLS fragment
+  // size) is NOT enabled in this framework build - the 32KB requirement is a fixed property
+  // of the precompiled library, not reducible from application code without rebuilding
+  // ESP-IDF itself (out of scope tonight). What IS available: checking whether a big enough
+  // *contiguous* block exists before even trying (skip a doomed multi-second connect
+  // timeout instead of blocking on it), and pausing the BLE scan for the attempt's duration
+  // (same trick already proven for the captive portal - see setup()) to free up whatever
+  // headroom the scan's own buffers were holding.
+  size_t largestBlock = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  Serial.printf("[Usage] Largest free contiguous block: %u bytes\n", (unsigned)largestBlock);
+  if (largestBlock < USAGE_FETCH_MIN_CONTIGUOUS_HEAP) {
+    Serial.printf("[Usage] Skipping fetch - largest block (%u) below the ~%u needed for the "
+                  "TLS handshake; will retry next cycle\n",
+                  (unsigned)largestBlock, (unsigned)USAGE_FETCH_MIN_CONTIGUOUS_HEAP);
+    return;
+  }
+
+  bool wasScanning = NimBLEDevice::getScan()->isScanning();
+  if (wasScanning) NimBLEDevice::getScan()->stop();
+
   WiFiClientSecure client;
   client.setInsecure(); // no cert pinning - matches this project's OTA self-update precedent
                         // (TDAI-2170's selfupdate.cpp does the same for its GitHub HTTPS calls)
@@ -519,6 +558,7 @@ static void fetchClaudeUsage() {
   http.setTimeout(8000);
   if (!http.begin(client, "https://api.anthropic.com/api/oauth/usage")) {
     Serial.println("[Usage] http.begin() failed");
+    if (wasScanning) NimBLEDevice::getScan()->start(0, false, true);
     return;
   }
   http.addHeader("Authorization", String("Bearer ") + g_claudeToken);
@@ -526,16 +566,27 @@ static void fetchClaudeUsage() {
 
   int code = http.GET();
   if (code != HTTP_CODE_OK) {
-    Serial.printf("[Usage] HTTP %d\n", code);
+    Serial.printf("[Usage] HTTP %d (largest block was %u)\n", code, (unsigned)largestBlock);
     http.end();
+    if (wasScanning) NimBLEDevice::getScan()->start(0, false, true);
     return;
   }
 
-  JsonDocument          doc;
-  DeserializationError  err = deserializeJson(doc, http.getStream());
+  // Buffered into a String and parsed from that, not streamed directly from http.getStream()
+  // - confirmed live, 2026-07-15, that stream-parsing failed with "InvalidInput" even after
+  // a successful HTTP 200, cause not yet identified (possibly a chunked-encoding/stream-
+  // timing interaction between HTTPClient and ArduinoJson on this core). The response body
+  // is tiny (a few hundred bytes) so buffering it first costs nothing meaningful, and this
+  // also lets a failure log the actual bytes received instead of guessing blind.
+  String responseBody = http.getString();
   http.end();
+  if (wasScanning) NimBLEDevice::getScan()->start(0, false, true);
+
+  JsonDocument         doc;
+  DeserializationError err = deserializeJson(doc, responseBody);
   if (err) {
-    Serial.printf("[Usage] JSON parse error: %s\n", err.c_str());
+    Serial.printf("[Usage] JSON parse error: %s - response body (%u bytes): %s\n", err.c_str(),
+                  responseBody.length(), responseBody.c_str());
     return;
   }
 
@@ -1128,6 +1179,18 @@ void setup() {
   lv_timer_handler();
 
   Serial.printf("[BOOT] Free heap after display+LVGL init: %u bytes\n", ESP.getFreeHeap());
+  {
+    // One-off measurement, 2026-07-15, to inform whether LV_MEM_SIZE (currently 40KB,
+    // lv_conf.h) is over-provisioned for this project's actual widget count, as part of
+    // freeing more contiguous headroom for the Claude usage fetch's TLS handshake (see
+    // fetchClaudeUsage()) - all three screens (dashboard, clock incl. the usage zone,
+    // WiFi config) are built by this point, so this reflects real peak usage, not a guess.
+    lv_mem_monitor_t mon;
+    lv_mem_monitor(&mon);
+    Serial.printf("[BOOT] LVGL pool: %u total, %u used (%u%%), %u free, biggest free block %u\n",
+                  (unsigned)mon.total_size, (unsigned)(mon.total_size - mon.free_size), mon.used_pct,
+                  (unsigned)mon.free_size, (unsigned)mon.free_biggest_size);
+  }
 
   // WiFi + NTP (experimental, see file header) - kicked off once at boot, then left running
   // continuously alongside BLE, toggled off only while a Pinecil is connected (see loop()).
@@ -1255,7 +1318,15 @@ void loop() {
   // once the portal closes (saved successfully, or its own timeout - see setup()).
   if (clockScreenActive) {
     wm.process();
-    if (otaStarted) ArduinoOTA.handle();
+    if (otaStarted) {
+      if (!otaInProgress && millis() - otaStartedAtMs > OTA_WINDOW_MS) {
+        Serial.println("[OTA] Listening window closed - freeing its resources (reboot to reopen)");
+        ArduinoOTA.end();
+        otaStarted = false;
+      } else {
+        ArduinoOTA.handle();
+      }
+    }
     if (settingsServerStarted) settingsServer.handleClient();
 
     // onConfigPortalStart()'s stop() call is a single synchronous attempt made right as

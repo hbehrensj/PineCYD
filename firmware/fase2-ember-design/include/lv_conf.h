@@ -49,7 +49,13 @@
 #define LV_MEM_CUSTOM 0
 #if LV_MEM_CUSTOM == 0
     /*Size of the memory available for `lv_mem_alloc()` in bytes (>= 2kB)*/
-    #define LV_MEM_SIZE (40U * 1024U)          /*[bytes] - sized for the full Ember layout (chart, several labels/objs); still small next to what NimBLE leaves free on this no-PSRAM board*/
+    /* 40KB -> 20KB, 2026-07-15: lv_mem_monitor() on real hardware (all 3 screens built -
+       dashboard, clock incl. the Claude usage zone, WiFi config) showed only ~13KB actually
+       used - the original 40KB was a rough guess, not measured. Freed ~20KB back to the
+       general heap as part of giving the Claude usage fetch's TLS handshake a better chance
+       at finding a large contiguous block (see fetchClaudeUsage()'s comment) - still ~7KB
+       (35%) of headroom above measured usage, not cut to the bone. */
+    #define LV_MEM_SIZE (20U * 1024U)          /*[bytes]*/
 
     /*Set an address for the memory pool instead of allocating it as a normal array. Can be in external SRAM too.*/
     #define LV_MEM_ADR 0     /*0: unused*/

@@ -64,8 +64,13 @@ found and fixed on real hardware.
 - **The clock screen now shows Claude Code usage** (5-hour/7-day/7-day-Sonnet, ported from
   a sibling project's design doc) - built with an explicitly user-chosen security tradeoff
   (an OAuth token entered and stored on-device, not kept off-device via a safer bridge
-  script) that's documented rather than silently decided. See the firmware README's "Claude
-  usage zone" section - **not yet verified on real hardware.**
+  script) that's documented rather than silently decided. Getting the fetch itself reliable
+  took real diagnosis: TLS handshakes were failing from heap fragmentation (not total free
+  memory - see the firmware README's "Claude usage zone" section for the full writeup),
+  fixed by measuring and shrinking LVGL's over-provisioned memory pool, pausing BLE
+  scanning during each fetch, and failing fast when a fetch is clearly doomed instead of
+  blocking on it. **Verified working end-to-end on real hardware**, real token, real data
+  on screen.
 
 ## Building
 

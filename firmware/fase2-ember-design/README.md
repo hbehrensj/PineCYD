@@ -357,28 +357,73 @@ timezone are already configured. Real, accepted risks worth restating plainly:
 - HTTPS uses `WiFiClientSecure::setInsecure()` (no certificate pinning), matching this
   project's OTA self-update precedent - acceptable for a hobby device, but worth knowing.
 
-**Not yet verified on real hardware.** The device went offline (USB/power disconnected)
-before this could be flashed. Specifically unverified:
-- Whether the clock/date/usage-zone vertical stack actually fits in 240px without overlap
-  or clipping - built using `lv_obj_align_to()` cascades specifically to avoid needing to
-  know the 72px custom font's exact rendered height up front (see `buildClockUi()`'s own
-  comment), but the total *does* still need to fit, which hasn't been confirmed.
-  Row spacing/positions may need tuning once actually seen.
-- Whether the Danish weekday abbreviations "søn"/"lør" (the two containing `ø`, U+00F8)
-  render correctly in the standard built-in `lv_font_montserrat_14` - this project has hit
-  exactly this class of missing-glyph bug before (bullet vs. middle-dot, see below); the
-  existing successful use of the degree sign (also Latin-1 Supplement) elsewhere in this
-  file suggests it likely will, but that's an inference, not a confirmation.
-- The actual fetch/parse/render cycle against a real token and a real response.
-- Heap/flash headroom under this combined load in practice, not just the static build
-  report below.
+**Verified on real hardware, 2026-07-15 - layout confirmed, but the fetch itself is not
+reliable yet.** The clock/date/usage-zone stack fits and renders correctly (including the
+Danish "søn"/"lør" weekday abbreviations - the missing-glyph risk flagged earlier turned out
+fine). The settings page (below) works. But the actual HTTPS fetch has a real, reproducible
+reliability problem:
 
-**Flash headroom is now genuinely tight**: 93.8% of the 1.875MiB OTA slot (`partitions_ota.csv`)
+**The TLS handshake to `api.anthropic.com` frequently fails with a memory allocation
+error** (`X509 - Allocation of memory failed` / `BIGNUM - Memory allocation failed`), and
+`ESP.getMinFreeHeap()` was observed dropping as low as **5.7-5.9KB**. This is not "too
+little total free memory" - the board typically reports 50KB+ free at the same moment - it's
+**heap fragmentation**: a TLS handshake needs a large *contiguous* block (mbedTLS's
+`MBEDTLS_SSL_IN_CONTENT_LEN`/`MBEDTLS_SSL_OUT_CONTENT_LEN` default to 16KB each, 32KB total,
+compiled into the prebuilt framework library - `NetworkClientSecure` on this core has no
+runtime `setBufferSizes()` to shrink them, unlike older ESP32 Arduino cores), and running
+BLE+LVGL+WiFiManager+ArduinoOTA+mDNS+a settings WebServer all concurrently on a no-PSRAM
+board leaves the heap fragmented enough that a block that size often isn't available.
+
+Two hypotheses were tested and **disproved**:
+- *Reduced BLE scan duty cycle* (thinking it was the same WiFi-starved-by-BLE contention
+  that made the captive portal unjoinable, see above) - no effect on the failure rate.
+- *Keeping WiFi on continuously instead of toggling it off while a Pinecil is connected*
+  (thinking repeated init/teardown of mDNS/OTA/the settings server was fragmenting the
+  heap) - **also no effect**: `min_heap` still collapsed to ~5.7KB with WiFi never once
+  power-cycled. This also cost real BLE latency (`cycle_ms` ~49-137ms, averaging
+  noticeably worse than the ~54-70ms this project normally achieves) for zero benefit, so
+  the WiFi on/off toggle was reverted back to its original behavior.
+
+One real fix was found and confirmed: the fetch used to also run *eagerly* on every WiFi
+(re)connect, right in the middle of `otaBegin()`/`settingsServerBegin()`/mDNS all
+initializing at once - the worst possible moment for a 32KB allocation. Removing that eager
+call, and reducing `USAGE_FETCH_INTERVAL_MS` from 60s to 5 minutes (fewer attempts at the
+risky operation, not smaller peak memory need), meaningfully improved things but did **not**
+eliminate the failures - a fetch triggered well after boot, with a healthy ~50KB heap
+reported, still failed the same way.
+
+**Conclusion: the fragmentation appears structural** to this exact combination of libraries
+on a no-PSRAM ESP32, not something fixable by sequencing/timing changes alone. The
+originally-offered, user-declined alternative - a small bridge script on a trusted machine
+holding the token and serving only sanitized percentages, so the device never does TLS at
+all - remains the most promising path if full reliability is wanted. Left as-is for now
+(best-effort: succeeds when it can find a big enough contiguous block, shows "FORSINKET"
+when it can't) per the user's explicit choice to keep trying on-device rather than switch
+architectures tonight.
+
+**Flash headroom is now genuinely tight**: ~94% of the 1.875MiB OTA slot (`partitions_ota.csv`)
 after adding ArduinoJson + HTTPClient + WiFiClientSecure on top of everything else - only
 ~120KB of slot headroom left for any future addition. If that becomes a real constraint,
 the next lever is enlarging the OTA slots themselves (fewer than two would defeat OTA's own
 purpose) - which means another partition-table change and another mandatory USB reflash,
 same as the one `partitions_ota.csv` itself required.
+
+### Always-on settings page (2026-07-15)
+
+`http://pinecyd.local/` (plain HTTP, reachable while the clock screen is showing) lets you
+update the Claude usage token or timezone without the BOOT-button/captive-portal dance -
+added because the token isn't refreshed (see above) and was expected to need re-entry every
+few hours, making the portal-only flow too much friction. Two real bugs found and fixed
+along the way:
+- **Saving used to hang the browser** - `handleSettingsSave()` called `fetchClaudeUsage()`
+  (an HTTPS call with an up-to-16s timeout budget) *synchronously*, before sending the HTTP
+  response. Fixed by setting a `g_forceUsageFetch` flag instead and letting `loop()` do the
+  actual fetch on its next tick, so the browser gets an instant response.
+- **Reloading the page was unstable** - the ESP32's basic `WebServer` handles HTTP
+  keep-alive poorly; a browser reload firing more than one request close together (page +
+  favicon.ico) could leave it stuck. Fixed with an explicit `Connection: close` header on
+  every response and a real `onNotFound()` handler (mainly to answer the favicon request
+  quickly rather than leave it unhandled).
 
 ## Bugs found and fixed along the way
 

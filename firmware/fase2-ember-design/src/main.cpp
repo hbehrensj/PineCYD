@@ -47,6 +47,7 @@ using fs::File;
 #include <Preferences.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
+#include <WebServer.h>
 #include <ArduinoJson.h>
 #include <esp_system.h>
 #include <lvgl.h>
@@ -358,6 +359,88 @@ static void otaBegin() {
   Serial.printf("[OTA] Ready: %s.local (espota), hostname=%s\n", OTA_HOSTNAME, OTA_HOSTNAME);
 }
 
+// --- Always-on settings page (2026-07-15) ---
+// The WiFiManager portal only exists for a few seconds at a time (auto-triggered on
+// connect failure, or forced by holding BOOT) - fine for one-time WiFi setup, but the
+// Claude usage token is expected to need periodic re-entry (it isn't refreshed - see
+// README.md), and going through the BOOT-hold/portal dance every time is real friction for
+// something you might do every few hours. This is a small always-on page at
+// http://pinecyd.local/, reachable during normal WiFi-connected operation (same on/off
+// lifecycle as ArduinoOTA/mDNS above - started on WiFi connect, torn down on WiFi off) -
+// no separate portal/AP needed to update the token or timezone.
+static WebServer settingsServer(80);
+static bool       settingsServerStarted = false;
+static void        fetchClaudeUsage(); // defined below; forward-declared for handleSettingsSave()
+// Set by handleSettingsSave() to trigger an early fetch from loop() instead of calling
+// fetchClaudeUsage() synchronously from the HTTP handler itself - that blocked the
+// browser's Save request for the fetch's own up-to-16s HTTPS timeout budget, confirmed
+// live, 2026-07-15 (the page just hung on "Waiting for pinecyd.local...").
+static bool g_forceUsageFetch = false;
+
+// Explicit "Connection: close" on every response below - the ESP32 WebServer library is
+// synchronous/single-connection and handles HTTP keep-alive poorly; a browser reload often
+// fires more than one request close together (the page plus a favicon.ico fetch, at least)
+// and without this, the server can end up stuck waiting on a connection the browser thinks
+// it can reuse - confirmed live, 2026-07-15, as "the page hangs on reload."
+static void handleSettingsRoot() {
+  String html =
+      "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+      "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+      "<title>PineCYD settings</title></head><body style='font-family:sans-serif; max-width:420px; margin:2em auto;'>"
+      "<h3>PineCYD settings</h3>"
+      "<form method='POST' action='/save'>"
+      "<label>Claude usage token (blank = keep existing):</label><br>"
+      "<input type='password' name='token' style='width:100%; box-sizing:border-box;'><br><br>"
+      "<label>Timezone (POSIX TZ string):</label><br>"
+      "<input type='text' name='tz' value='" +
+      g_timezone +
+      "' style='width:100%; box-sizing:border-box;'><br><br>"
+      "<input type='submit' value='Save'>"
+      "</form></body></html>";
+  settingsServer.sendHeader("Connection", "close");
+  settingsServer.send(200, "text/html", html);
+}
+
+static void handleSettingsNotFound() {
+  settingsServer.sendHeader("Connection", "close");
+  settingsServer.send(404, "text/plain", "Not found");
+}
+
+// Same blank-means-unchanged pattern as the portal's own onWifiConfigSaved() - see that
+// function's comment for why the token field is never pre-filled with its current value.
+static void handleSettingsSave() {
+  if (settingsServer.hasArg("token") && settingsServer.arg("token").length() > 0) {
+    g_claudeToken = settingsServer.arg("token");
+    prefs.begin("pinecyd", false);
+    prefs.putString("claude_tok", g_claudeToken);
+    prefs.end();
+    Serial.println("[Settings] Claude usage token updated via web page");
+    g_forceUsageFetch = true; // loop() fetches on its next tick - see that flag's comment
+  }
+  if (settingsServer.hasArg("tz") && settingsServer.arg("tz").length() > 0) {
+    g_timezone = settingsServer.arg("tz");
+    prefs.begin("pinecyd", false);
+    prefs.putString("tz", g_timezone);
+    prefs.end();
+    configTzTime(g_timezone.c_str(), "pool.ntp.org", "time.google.com");
+    Serial.println("[Settings] Timezone updated via web page");
+  }
+  settingsServer.sendHeader("Location", "/");
+  settingsServer.sendHeader("Connection", "close");
+  settingsServer.send(303);
+}
+
+static void settingsServerBegin() {
+  if (settingsServerStarted) return;
+  if (WiFi.status() != WL_CONNECTED) return;
+  settingsServer.on("/", HTTP_GET, handleSettingsRoot);
+  settingsServer.on("/save", HTTP_POST, handleSettingsSave);
+  settingsServer.onNotFound(handleSettingsNotFound); // e.g. the browser's automatic favicon.ico request
+  settingsServer.begin();
+  settingsServerStarted = true;
+  Serial.printf("[Settings] Web settings page ready: http://%s.local/\n", OTA_HOSTNAME);
+}
+
 // --- Claude usage clock-screen widget (2026-07-15) ---
 // Ported from a handoff doc originally written for a sibling project's ESPHome/MQTT stack
 // (see README.md's "Claude usage zone" section) - this is the direct-fetch equivalent: the
@@ -375,7 +458,11 @@ struct UsageLine {
   bool        haveData;      // false until the first successful fetch
 };
 
-static const uint32_t USAGE_FETCH_INTERVAL_MS = 60000;          // 60s - doesn't need to feel live
+// 60s -> 5min, 2026-07-15: each fetch's TLS handshake needs ~32KB of heap (see
+// fetchClaudeUsage()'s comment) that can't be reduced on this core - the only lever left is
+// how often it's attempted at all. 5-minute-stale usage data is a fine tradeoff; a
+// heap-exhaustion crash is not.
+static const uint32_t USAGE_FETCH_INTERVAL_MS = 5 * 60 * 1000;
 static const uint32_t USAGE_STALE_AFTER_MS    = 15 * 60 * 1000; // 15 min, per the handoff doc's stale rule
 
 static UsageLine g_usageLines[3] = {
@@ -415,6 +502,15 @@ static time_t parseIso8601Utc(const char* s) {
 static void fetchClaudeUsage() {
   if (g_claudeToken.isEmpty() || WiFi.status() != WL_CONNECTED) return;
 
+  // Confirmed live, 2026-07-15: this handshake's default mbedTLS RX/TX buffers (16KB each,
+  // baked into the prebuilt framework library - not runtime-configurable on this core;
+  // NetworkClientSecure has no setBufferSizes() here, unlike older ESP32 Arduino cores) are
+  // a real problem on this no-PSRAM board once WiFiManager+OTA+mDNS+the settings webserver
+  // are also resident: min_heap dropped to 5780 bytes and the handshake itself started
+  // failing ("X509 - Allocation of memory failed", HTTP -1/"connection refused"). Can't
+  // shrink the buffers without rebuilding ESP-IDF itself (out of scope tonight) - the lever
+  // actually available is frequency: USAGE_FETCH_INTERVAL_MS below controls how often this
+  // ~32KB-hungry handshake runs at all, which is what got tuned instead.
   WiFiClientSecure client;
   client.setInsecure(); // no cert pinning - matches this project's OTA self-update precedent
                         // (TDAI-2170's selfupdate.cpp does the same for its GitHub HTTPS calls)
@@ -644,35 +740,58 @@ static void buildClockUi() {
   lv_obj_set_style_bg_color(scr_clock, COLOR_BLACK, 0);
   lv_obj_set_style_bg_opa(scr_clock, LV_OPA_COVER, 0);
 
+  // Fixed width (320, full screen) + centered text, on BOTH labels below - not just cosmetic.
+  // Confirmed live, 2026-07-15: an auto-sized label's lv_obj_align() only centers its
+  // box *once*, using whatever text is showing at that call - "--:--" (placeholder) and
+  // "--" (empty date) at build time. Later lv_label_set_text() calls change the label's
+  // content (and therefore its natural width) without ever re-running alignment, so the
+  // box's *position* stays anchored to the old, now-wrong width - visible on the real
+  // device as the date sitting off-center. Fixing width to the full screen and centering
+  // text *within* that fixed box sidesteps the whole problem: the box never resizes, so a
+  // one-time align is enough regardless of what text it ends up showing.
   label_clock_time = lv_label_create(scr_clock);
   lv_label_set_text(label_clock_time, "--:--");
   lv_obj_set_style_text_font(label_clock_time, &lv_font_montserrat_72_digits, 0);
   lv_obj_set_style_text_color(label_clock_time, COLOR_WHITE, 0);
-  lv_obj_align(label_clock_time, LV_ALIGN_TOP_MID, 0, 2);
+  lv_obj_set_width(label_clock_time, 320);
+  lv_obj_set_style_text_align(label_clock_time, LV_TEXT_ALIGN_CENTER, 0);
+  // Pushed down from an initial y=2, 2026-07-15: real hardware showed the digits'
+  // top edge overlapping the "SCANNING..."/"FORSINKET" corner labels at y=6-8.
+  // 24 -> 44, 2026-07-15: real-hardware feedback was "the whole clock/date/bars group sits
+  // too high, with unused space at the bottom" - the relative gaps between clock/date/first
+  // bar were fine as-is, so only this top margin (which the align_to() cascade below
+  // inherits) needed to move, not the individual gaps.
+  lv_obj_align(label_clock_time, LV_ALIGN_TOP_MID, 0, 44);
 
   label_clock_date = lv_label_create(scr_clock);
   lv_label_set_text(label_clock_date, "");
   lv_obj_set_style_text_font(label_clock_date, &lv_font_montserrat_14, 0);
   lv_obj_set_style_text_color(label_clock_date, COLOR_USAGE_ASH, 0);
+  lv_obj_set_width(label_clock_date, 320);
+  lv_obj_set_style_text_align(label_clock_date, LV_TEXT_ALIGN_CENTER, 0);
   lv_obj_align_to(label_clock_date, label_clock_time, LV_ALIGN_OUT_BOTTOM_MID, 0, 0);
 
   lv_obj_t* subLabel = makeLabel(scr_clock, 4, 6, &lv_font_montserrat_12, COLOR_GRAY, "SCANNING...");
   lv_obj_set_style_text_letter_space(subLabel, 1, 0);
 
   // --- Claude usage zone (2026-07-15, see README.md) ---
-  // Geometry (track/label/pct column widths, row height/gap, marker/fill logic) is a 1:1
-  // translation of the handoff doc's buildLine()/makeFrame() JS - see that doc for the
-  // full derivation. Fixed at 3 rows (5T/UGE/SON, matching g_usageLines) rather than the
-  // doc's general 2-4-row system - the real API always returns exactly these three buckets.
+  // Geometry (track/label/pct column widths, marker/fill logic) is a 1:1 translation of the
+  // handoff doc's buildLine()/makeFrame() JS - see that doc for the full derivation. Row gap
+  // (8px in the doc) tightened twice after real-hardware feedback (8->5->3) - the user
+  // asked for the three bars to sit closer together than the doc's original spacing. Fixed
+  // at 3 rows (5T/UGE/SON, matching g_usageLines) rather than the doc's general 2-4-row
+  // system - the real API always returns exactly these three buckets.
   usageZone = lv_obj_create(scr_clock);
   lv_obj_set_style_bg_opa(usageZone, LV_OPA_TRANSP, 0);
   lv_obj_set_style_border_width(usageZone, 0, 0);
   lv_obj_set_style_pad_all(usageZone, 0, 0);
   lv_obj_clear_flag(usageZone, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_set_size(usageZone, 304, 112); // 3 rows * 32px + 2 gaps * 8px, per the handoff doc
-  lv_obj_align_to(usageZone, label_clock_date, LV_ALIGN_OUT_BOTTOM_MID, 0, 6);
+  lv_obj_set_size(usageZone, 304, 102); // 3 rows * 32px + 2 gaps * 3px
+  // Gap from the date (16) confirmed fine as-is on real hardware - only the group's overall
+  // vertical position (label_clock_time's own top margin, above) needed to move, not this.
+  lv_obj_align_to(usageZone, label_clock_date, LV_ALIGN_OUT_BOTTOM_MID, 0, 16);
 
-  static const int trackW = 200, labelW = 32, pctW = 40, rowH = 32, barH = 16, gap = 8;
+  static const int trackW = 200, labelW = 32, pctW = 40, rowH = 32, barH = 16, gap = 3;
   for (int i = 0; i < 3; i++) {
     int rowY = i * (rowH + gap);
 
@@ -1038,11 +1157,17 @@ void setup() {
   wm.addParameter(&tokenParam);
 
   if (bootButtonHeld) {
-    Serial.println("[BOOT] BOOT button held at boot - resetting stored WiFi config and forcing the portal");
-    wm.resetSettings();
+    // startConfigPortal() (not resetSettings()+autoConnect()) - forces the portal open
+    // without erasing the stored WiFi network first. Originally used resetSettings(), but
+    // that meant editing just the token or timezone field required re-entering WiFi
+    // credentials too in the same portal visit - unnecessary friction once this portal
+    // started collecting more than just WiFi. Still lets you pick a different network from
+    // here if you want to; it just doesn't force you to.
+    Serial.println("[BOOT] BOOT button held at boot - forcing the WiFi/token/timezone portal (network kept as-is)");
+    wm.startConfigPortal(WIFI_AP_NAME);
+  } else {
+    connectWifiNow(); // returns almost immediately either way; loop() drives the rest
   }
-
-  connectWifiNow(); // returns almost immediately either way; loop() drives the rest
   Serial.println("[BOOT] WiFi connect/portal kicked off (non-blocking) - see loop() for progress");
   Serial.printf("[BOOT] Free heap after WiFi init: %u bytes\n", ESP.getFreeHeap());
 
@@ -1053,6 +1178,12 @@ void setup() {
   pScan->setScanCallbacks(&scanCallbacks, false);
   pScan->setInterval(100);
   pScan->setWindow(100);
+  // A 40% duty cycle was tried here, 2026-07-15, as a hypothesis for the settings page's
+  // slowness (matching the already-confirmed BLE-scan-starves-WiFi contention that made the
+  // captive portal unjoinable). Reverted - real-hardware testing with USB serial access
+  // showed the actual cause was heap exhaustion during TLS handshakes (see
+  // fetchClaudeUsage()'s setBufferSizes() comment), not radio contention. No reason to pay
+  // slower Pinecil discovery for a fix that measurably didn't help.
   pScan->setActiveScan(true);
   // Prevents NimBLE from permanently caching every unique advertiser it ever sees (up to
   // 255) - we only use the live onResult() callback, never getResults(). An unattended
@@ -1080,6 +1211,17 @@ void loop() {
   // and removes the WiFi/BT coexistence contention that was measurably slowing down BLE
   // polling - see README.md), back on only while showing the clock, which is the only
   // thing that needs it. At the user's suggestion, 2026-07-13.
+  //
+  // Tried removing this toggle entirely (WiFi always on), 2026-07-15, testing whether it
+  // was contributing to the heap fragmentation behind the Claude usage fetch's TLS
+  // allocation failures (see fetchClaudeUsage()'s comment) - real-hardware testing
+  // disproved this: min_heap still collapsed to ~5.7KB with WiFi continuously on, no
+  // different from before. It also cost real BLE latency (cycle_ms ~49-137ms, averaging
+  // notably worse than the ~54-70ms this toggle normally achieves) for zero benefit.
+  // Reverted. The fragmentation appears structural to running BLE+LVGL+WiFiManager+OTA+
+  // mDNS+WebServer+periodic TLS together on this no-PSRAM board, not an artifact of this
+  // toggle's on/off cycling - see README.md's "Claude usage zone" section for the fuller
+  // writeup and what's actually left to try (the bridge-script architecture).
   static uint32_t lastWifiAttempt = 0; // shared with the retry block below
   bool            shouldShowClock = !connected;
   // If a Pinecil connects while an OTA transfer is actively in progress, defer turning WiFi
@@ -1100,8 +1242,9 @@ void loop() {
       if (wm.getConfigPortalActive()) wm.stopConfigPortal();
       wifiConfigActive = false;
       MDNS.end();
-      otaStarted = false; // ArduinoOTA's listener doesn't survive a WiFi power-cycle -
-                          // otaBegin() re-runs fresh next time WiFi reconnects (see below)
+      otaStarted            = false; // ArduinoOTA's listener doesn't survive a WiFi power-cycle -
+                                     // otaBegin()/settingsServerBegin() re-run fresh next
+      settingsServerStarted = false; // time WiFi reconnects (see below)
       WiFi.disconnect(true);
       WiFi.mode(WIFI_OFF);
     }
@@ -1113,6 +1256,7 @@ void loop() {
   if (clockScreenActive) {
     wm.process();
     if (otaStarted) ArduinoOTA.handle();
+    if (settingsServerStarted) settingsServer.handleClient();
 
     // onConfigPortalStart()'s stop() call is a single synchronous attempt made right as
     // WiFi switches into AP_STA mode - confirmed live, 2026-07-13, that NimBLE's host task
@@ -1148,7 +1292,13 @@ void loop() {
       Serial.printf("[WiFi] mDNS ready: http://%s.local/\n", OTA_HOSTNAME);
     }
     otaBegin();
-    if (!g_claudeToken.isEmpty()) fetchClaudeUsage(); // don't wait a full 60s for the first one
+    settingsServerBegin();
+    // Deliberately NOT calling fetchClaudeUsage() eagerly here anymore, 2026-07-15: this
+    // used to fire immediately on every WiFi (re)connect, right in the middle of
+    // otaBegin()/settingsServerBegin()/mDNS all initializing at once - confirmed live as
+    // the actual trigger for the TLS handshake's memory-allocation failures (worst possible
+    // moment for a ~32KB allocation attempt). The periodic check below now handles the
+    // first fetch too, naturally landing after things have settled.
     if (g_wifiSsid.isEmpty()) {
       g_wifiSsid = WiFi.SSID();
       g_wifiPsk  = WiFi.psk();
@@ -1193,8 +1343,9 @@ void loop() {
   // fetch) independently tunable.
   static uint32_t lastUsageFetch = 0;
   if (clockScreenActive && !g_claudeToken.isEmpty() && wifiNowConnected &&
-      millis() - lastUsageFetch >= USAGE_FETCH_INTERVAL_MS) {
-    lastUsageFetch = millis();
+      (g_forceUsageFetch || millis() - lastUsageFetch >= USAGE_FETCH_INTERVAL_MS)) {
+    lastUsageFetch     = millis();
+    g_forceUsageFetch  = false;
     fetchClaudeUsage();
   }
 

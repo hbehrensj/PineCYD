@@ -61,6 +61,11 @@ found and fixed on real hardware.
   (pioarduino) than a fresh CI environment resolved by default - now pinned explicitly.
 - **The clock's timezone was hardcoded** (Copenhagen) until a user in another timezone
   would have seen the wrong time - now configurable via the same WiFi setup portal.
+- **The clock screen now shows Claude Code usage** (5-hour/7-day/7-day-Sonnet, ported from
+  a sibling project's design doc) - built with an explicitly user-chosen security tradeoff
+  (an OAuth token entered and stored on-device, not kept off-device via a safer bridge
+  script) that's documented rather than silently decided. See the firmware README's "Claude
+  usage zone" section - **not yet verified on real hardware.**
 
 ## Building
 

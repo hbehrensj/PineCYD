@@ -45,6 +45,9 @@ using fs::File;
 #include <ArduinoOTA.h>
 #include <ESPmDNS.h>
 #include <Preferences.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <ArduinoJson.h>
 #include <esp_system.h>
 #include <lvgl.h>
 #include <time.h>
@@ -123,6 +126,20 @@ static const lv_color_t COLOR_DEEP_ORANGE = LV_COLOR_MAKE(0xFF, 0x66, 0x00);
 static const lv_color_t COLOR_STEEL_BLUE = LV_COLOR_MAKE(0x60, 0x66, 0x82);
 static const lv_color_t COLOR_MISTY_BLUE = LV_COLOR_MAKE(0x9B, 0xA2, 0xBC);
 
+// --- Ember Usage palette (2026-07-15) - Claude usage clock-screen zone. Distinct exact hex
+// values from a handoff doc originally written for a sibling project (DeskDash), close to
+// but not identical to the dashboard palette above (e.g. ember-core #FF6A2B vs. this file's
+// own ep_orange #F37320) - kept as separate named constants for 1:1 fidelity to that doc
+// rather than reusing the nearest existing token. Screen background reuses COLOR_BLACK
+// (#0D0D0D) instead of the doc's ember-bg (#14100C) - close enough to not be worth a second
+// near-duplicate black, and keeps the clock screen consistent with the dashboard screen.
+static const lv_color_t COLOR_USAGE_SURFACE = LV_COLOR_MAKE(0x24, 0x1C, 0x14);
+static const lv_color_t COLOR_USAGE_CORE    = LV_COLOR_MAKE(0xFF, 0x6A, 0x2B);
+static const lv_color_t COLOR_USAGE_HOT     = LV_COLOR_MAKE(0xFF, 0xB0, 0x3A);
+static const lv_color_t COLOR_USAGE_ALERT   = LV_COLOR_MAKE(0xFF, 0x3B, 0x2F);
+static const lv_color_t COLOR_USAGE_ASH     = LV_COLOR_MAKE(0x8A, 0x7A, 0x6A);
+static const lv_color_t COLOR_USAGE_TEXT    = LV_COLOR_MAKE(0xF2, 0xE7, 0xD8);
+
 static const NimBLEAdvertisedDevice* advDevice    = nullptr;
 static NimBLEClient*                 pClient      = nullptr;
 static NimBLERemoteCharacteristic*   pChrLiveTemp   = nullptr;
@@ -165,7 +182,20 @@ static lv_chart_series_t* series_setpoint_ref;
 static lv_obj_t* scr_dashboard;
 static lv_obj_t* scr_clock;
 static lv_obj_t* label_clock_time;
+static lv_obj_t* label_clock_date;
 static bool      clockScreenActive = false; // set explicitly once at boot, see setup()
+
+// Claude usage zone (2026-07-15) - see buildClockUi()/updateUsageZoneDisplay(). Fixed at 3
+// rows (five_hour/seven_day/seven_day_sonnet - matches the real API shape) rather than the
+// handoff doc's general 2-4-row system.
+static lv_obj_t* usageZone;
+static lv_obj_t* usageRowLabel[3];
+static lv_obj_t* usageTrack[3];
+static lv_obj_t* usageFill[3];
+static lv_obj_t* usageMarker[3];
+static lv_obj_t* usagePct[3];
+static lv_obj_t* usageReset[3];
+static lv_obj_t* usageStaleTag;
 
 // WiFi captive-portal config screen (shown only while the WiFiManager AP+portal is open).
 static lv_obj_t* scr_wifi_config;
@@ -207,12 +237,24 @@ static String            g_timezone = DEFAULT_TZ;
 static Preferences        prefs;
 static WiFiManagerParameter* pTzParam = nullptr; // registered in setup(), read in onWifiConfigSaved()
 
+// Claude usage clock-screen widget (2026-07-15) - user's own explicit choice, after being
+// offered a safer alternative (a local bridge script holding the token, device only ever
+// sees derived percentages), to instead enter the OAuth token directly on-device via this
+// same portal, matching how WiFi credentials/timezone already work. Real risk accepted
+// knowingly: this is a live OAuth access token for the user's own Anthropic account,
+// against an undocumented endpoint the device can't refresh on its own - see README.md for
+// the full tradeoff writeup and the expiry caveat.
+static String                g_claudeToken;
+static WiFiManagerParameter* pTokenParam = nullptr; // registered in setup(), read below
+
 // Fires when the portal's form is submitted (WiFiManager's own save-config hook) -
 // independent of whether the WiFi connect attempt that follows succeeds, so this also
-// captures the timezone on a portal session that's only being used to switch networks.
-// Blank input is treated as "leave unchanged" (matches TDAI's own optional-field pattern),
-// not "reset to default" - the field is always pre-filled with the current value anyway,
-// so blank only happens if the user deliberately clears it.
+// captures these fields on a portal session that's only being used to switch networks.
+// Blank input means "leave unchanged" for both fields (matches TDAI's own optional-field
+// pattern) - the timezone field is pre-filled with its current value so blank only happens
+// if deliberately cleared; the token field is deliberately left BLANK by default (not
+// pre-filled with the stored token) so the live secret is never re-emitted into a served
+// HTML page's source just to show the user what they'd already saved.
 static void onWifiConfigSaved() {
   if (pTzParam && strlen(pTzParam->getValue()) > 0) {
     g_timezone = pTzParam->getValue();
@@ -220,6 +262,13 @@ static void onWifiConfigSaved() {
     prefs.putString("tz", g_timezone);
     prefs.end();
     Serial.printf("[WiFi] Timezone saved: %s\n", g_timezone.c_str());
+  }
+  if (pTokenParam && strlen(pTokenParam->getValue()) > 0) {
+    g_claudeToken = pTokenParam->getValue();
+    prefs.begin("pinecyd", false);
+    prefs.putString("claude_tok", g_claudeToken);
+    prefs.end();
+    Serial.println("[WiFi] Claude usage token saved");
   }
 }
 
@@ -307,6 +356,115 @@ static void otaBegin() {
   ArduinoOTA.begin();
   otaStarted = true;
   Serial.printf("[OTA] Ready: %s.local (espota), hostname=%s\n", OTA_HOSTNAME, OTA_HOSTNAME);
+}
+
+// --- Claude usage clock-screen widget (2026-07-15) ---
+// Ported from a handoff doc originally written for a sibling project's ESPHome/MQTT stack
+// (see README.md's "Claude usage zone" section) - this is the direct-fetch equivalent: the
+// device itself polls api.anthropic.com's undocumented usage endpoint using a user-supplied
+// OAuth token (see the WiFiManagerParameter above), rather than a local bridge script. The
+// endpoint shape, the "5T"/"UGE"/"SON" labels, and the pace-marker/stale-state logic are
+// taken directly from that doc.
+struct UsageLine {
+  const char* label;
+  uint32_t    periodSeconds; // known window length - the API gives resets_at but not the
+                              // window's start, so period_pct (pace marker position) is
+                              // derived from this + resets_at + now, not read from the API.
+  float       pct;           // last-fetched utilization, 0-100
+  time_t      resetsAt;      // last-fetched reset time, epoch seconds (UTC)
+  bool        haveData;      // false until the first successful fetch
+};
+
+static const uint32_t USAGE_FETCH_INTERVAL_MS = 60000;          // 60s - doesn't need to feel live
+static const uint32_t USAGE_STALE_AFTER_MS    = 15 * 60 * 1000; // 15 min, per the handoff doc's stale rule
+
+static UsageLine g_usageLines[3] = {
+  {"5T",  5 * 3600UL,  0.0f, 0, false},
+  {"UGE", 7 * 86400UL, 0.0f, 0, false},
+  {"SON", 7 * 86400UL, 0.0f, 0, false},
+};
+static uint32_t g_lastUsageFetchOkMs = 0; // 0 = never succeeded yet
+
+// UTC civil-date -> epoch-seconds, no libc dependency: this toolchain doesn't provide
+// timegm() (confirmed by a real build failure, 2026-07-15), and mktime() is the wrong tool
+// anyway (applies local-timezone rules; these timestamps are always Z-suffixed UTC).
+// Howard Hinnant's "days_from_civil" algorithm - portable, correct across the whole
+// proleptic Gregorian calendar including leap years.
+static time_t utcTmToEpoch(int year, int mon /* 1-12 */, int day, int hour, int min, int sec) {
+  int      y   = year - (mon <= 2 ? 1 : 0);
+  long     era = (y >= 0 ? y : y - 399) / 400;
+  unsigned yoe = (unsigned)(y - era * 400);                                   // [0, 399]
+  unsigned doy = (153 * (mon + (mon > 2 ? -3 : 9)) + 2) / 5 + day - 1;         // [0, 365]
+  unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;                       // [0, 146096]
+  long     days = era * 146097L + (long)doe - 719468L;                       // since 1970-01-01
+  return (time_t)days * 86400L + hour * 3600L + min * 60L + sec;
+}
+
+// Minimal ISO8601 UTC parser ("2026-02-28T17:00:00Z") - the API only ever returns this exact
+// shape (per the sample payload), so a full RFC3339 parser is out of scope.
+static time_t parseIso8601Utc(const char* s) {
+  int y, mo, d, h, mi, se;
+  if (sscanf(s, "%d-%d-%dT%d:%d:%d", &y, &mo, &d, &h, &mi, &se) != 6) return 0;
+  return utcTmToEpoch(y, mo, d, h, mi, se);
+}
+
+// Fetches usage and updates g_usageLines in place. Runs on its own schedule (see loop())
+// while WiFi is on; a failure just leaves the last-known values in place - staleness is
+// tracked separately via g_lastUsageFetchOkMs (last *successful* fetch), not fetch attempts,
+// matching the handoff doc's ">15min since last update" stale rule.
+static void fetchClaudeUsage() {
+  if (g_claudeToken.isEmpty() || WiFi.status() != WL_CONNECTED) return;
+
+  WiFiClientSecure client;
+  client.setInsecure(); // no cert pinning - matches this project's OTA self-update precedent
+                        // (TDAI-2170's selfupdate.cpp does the same for its GitHub HTTPS calls)
+  HTTPClient http;
+  http.setConnectTimeout(8000);
+  http.setTimeout(8000);
+  if (!http.begin(client, "https://api.anthropic.com/api/oauth/usage")) {
+    Serial.println("[Usage] http.begin() failed");
+    return;
+  }
+  http.addHeader("Authorization", String("Bearer ") + g_claudeToken);
+  http.addHeader("anthropic-beta", "oauth-2025-04-20");
+
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    Serial.printf("[Usage] HTTP %d\n", code);
+    http.end();
+    return;
+  }
+
+  JsonDocument          doc;
+  DeserializationError  err = deserializeJson(doc, http.getStream());
+  http.end();
+  if (err) {
+    Serial.printf("[Usage] JSON parse error: %s\n", err.c_str());
+    return;
+  }
+
+  static const char* KEYS[3] = {"five_hour", "seven_day", "seven_day_sonnet"};
+  bool                anyOk  = false;
+  for (int i = 0; i < 3; i++) {
+    JsonVariantConst bucket = doc[KEYS[i]];
+    if (bucket.isNull()) continue;
+    float       util         = bucket["utilization"] | -1.0f;
+    const char* resetsAtStr  = bucket["resets_at"] | "";
+    if (util < 0 || !resetsAtStr[0]) continue;
+    time_t resetsAt = parseIso8601Utc(resetsAtStr);
+    if (resetsAt == 0) continue;
+    g_usageLines[i].pct      = util * 100.0f;
+    g_usageLines[i].resetsAt = resetsAt;
+    g_usageLines[i].haveData = true;
+    anyOk                    = true;
+  }
+
+  if (anyOk) {
+    g_lastUsageFetchOkMs = millis();
+    Serial.println("[Usage] Fetched OK");
+  } else {
+    Serial.println("[Usage] Response had no usable buckets");
+  }
 }
 
 static const char* resetReasonToStr(esp_reset_reason_t r) {
@@ -470,6 +628,17 @@ static void buildUi() {
 
 // Shown whenever no Pinecil is connected (see loop()) - a separate LVGL screen, switched
 // to/from via lv_scr_load(), rather than hiding/showing individual dashboard widgets.
+//
+// Layout below (clock top-anchored, date/usage-zone cascaded via lv_obj_align_to() rather
+// than fixed y-coordinates) is a deliberate departure from this project's usual absolute-
+// position style: the handoff doc this was ported from (see README.md) assumed a 60px
+// clock font at a known y; this project's existing clock reuses its own already-verified
+// 72px custom digit font (permitted by the doc's own Typography section - "round to
+// whatever the existing bitmap font ladder already defines"), whose rendered height isn't
+// precisely known without measuring on real hardware. Cascading alignment sidesteps that
+// uncertainty entirely - each element sizes itself against its actual neighbor, not a
+// guessed pixel offset. **Not yet visually confirmed on real hardware** - the device went
+// offline before this could be flashed; row spacing/overall fit may need tuning once seen.
 static void buildClockUi() {
   scr_clock = lv_obj_create(NULL);
   lv_obj_set_style_bg_color(scr_clock, COLOR_BLACK, 0);
@@ -479,11 +648,160 @@ static void buildClockUi() {
   lv_label_set_text(label_clock_time, "--:--");
   lv_obj_set_style_text_font(label_clock_time, &lv_font_montserrat_72_digits, 0);
   lv_obj_set_style_text_color(label_clock_time, COLOR_WHITE, 0);
-  lv_obj_center(label_clock_time);
+  lv_obj_align(label_clock_time, LV_ALIGN_TOP_MID, 0, 2);
 
-  lv_obj_t* subLabel = makeLabel(scr_clock, 0, 0, &lv_font_montserrat_12, COLOR_GRAY, "SCANNING FOR PINECIL...");
+  label_clock_date = lv_label_create(scr_clock);
+  lv_label_set_text(label_clock_date, "");
+  lv_obj_set_style_text_font(label_clock_date, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(label_clock_date, COLOR_USAGE_ASH, 0);
+  lv_obj_align_to(label_clock_date, label_clock_time, LV_ALIGN_OUT_BOTTOM_MID, 0, 0);
+
+  lv_obj_t* subLabel = makeLabel(scr_clock, 4, 6, &lv_font_montserrat_12, COLOR_GRAY, "SCANNING...");
   lv_obj_set_style_text_letter_space(subLabel, 1, 0);
-  lv_obj_align(subLabel, LV_ALIGN_BOTTOM_MID, 0, -12);
+
+  // --- Claude usage zone (2026-07-15, see README.md) ---
+  // Geometry (track/label/pct column widths, row height/gap, marker/fill logic) is a 1:1
+  // translation of the handoff doc's buildLine()/makeFrame() JS - see that doc for the
+  // full derivation. Fixed at 3 rows (5T/UGE/SON, matching g_usageLines) rather than the
+  // doc's general 2-4-row system - the real API always returns exactly these three buckets.
+  usageZone = lv_obj_create(scr_clock);
+  lv_obj_set_style_bg_opa(usageZone, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(usageZone, 0, 0);
+  lv_obj_set_style_pad_all(usageZone, 0, 0);
+  lv_obj_clear_flag(usageZone, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_size(usageZone, 304, 112); // 3 rows * 32px + 2 gaps * 8px, per the handoff doc
+  lv_obj_align_to(usageZone, label_clock_date, LV_ALIGN_OUT_BOTTOM_MID, 0, 6);
+
+  static const int trackW = 200, labelW = 32, pctW = 40, rowH = 32, barH = 16, gap = 8;
+  for (int i = 0; i < 3; i++) {
+    int rowY = i * (rowH + gap);
+
+    usageRowLabel[i] = makeLabel(usageZone, 0, rowY + 8, &lv_font_montserrat_12, COLOR_USAGE_ASH, g_usageLines[i].label);
+
+    usageTrack[i] = lv_obj_create(usageZone);
+    lv_obj_set_pos(usageTrack[i], labelW, rowY + 3);
+    lv_obj_set_size(usageTrack[i], trackW, barH);
+    lv_obj_set_style_radius(usageTrack[i], barH / 2, 0);
+    lv_obj_set_style_bg_color(usageTrack[i], COLOR_USAGE_SURFACE, 0);
+    lv_obj_set_style_bg_opa(usageTrack[i], LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(usageTrack[i], 0, 0);
+    lv_obj_set_style_pad_all(usageTrack[i], 0, 0);
+    lv_obj_clear_flag(usageTrack[i], LV_OBJ_FLAG_SCROLLABLE);
+
+    // Fill is a separate stacked lv_obj, not a plain lv_bar - per-row gradient end-color
+    // needs to change (hot/alert/desaturated) depending on state, recomputed every refresh
+    // in updateUsageZoneDisplay(), which a single shared lv_bar style can't do per-instance
+    // as cheaply.
+    usageFill[i] = lv_obj_create(usageZone);
+    lv_obj_set_pos(usageFill[i], labelW, rowY + 3);
+    lv_obj_set_size(usageFill[i], 2, barH);
+    lv_obj_set_style_radius(usageFill[i], barH / 2, 0);
+    lv_obj_set_style_bg_color(usageFill[i], COLOR_USAGE_CORE, 0);
+    lv_obj_set_style_bg_grad_color(usageFill[i], COLOR_USAGE_HOT, 0);
+    lv_obj_set_style_bg_grad_dir(usageFill[i], LV_GRAD_DIR_HOR, 0);
+    lv_obj_set_style_bg_opa(usageFill[i], LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(usageFill[i], 0, 0);
+    lv_obj_set_style_pad_all(usageFill[i], 0, 0);
+    lv_obj_clear_flag(usageFill[i], LV_OBJ_FLAG_SCROLLABLE);
+
+    usageMarker[i] = lv_obj_create(usageZone);
+    lv_obj_set_pos(usageMarker[i], labelW, rowY + 3 - 2);
+    lv_obj_set_size(usageMarker[i], 2, barH + 4);
+    lv_obj_set_style_radius(usageMarker[i], 1, 0);
+    lv_obj_set_style_bg_color(usageMarker[i], COLOR_USAGE_ASH, 0);
+    lv_obj_set_style_bg_opa(usageMarker[i], LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(usageMarker[i], 0, 0);
+    lv_obj_set_style_pad_all(usageMarker[i], 0, 0);
+    lv_obj_clear_flag(usageMarker[i], LV_OBJ_FLAG_SCROLLABLE);
+
+    usagePct[i] = makeLabel(usageZone, labelW + trackW + 4, rowY + 6, &lv_font_montserrat_14, COLOR_USAGE_TEXT, "--%");
+    lv_obj_set_width(usagePct[i], pctW - 4);
+    lv_obj_set_style_text_align(usagePct[i], LV_TEXT_ALIGN_RIGHT, 0);
+
+    usageReset[i] = makeLabel(usageZone, labelW, rowY + 3 + barH + 2, &lv_font_montserrat_12, COLOR_USAGE_ASH, "");
+    lv_obj_set_width(usageReset[i], trackW + pctW);
+    lv_obj_set_style_text_align(usageReset[i], LV_TEXT_ALIGN_RIGHT, 0);
+  }
+
+  usageStaleTag = makeLabel(scr_clock, 0, 0, &lv_font_montserrat_12, COLOR_USAGE_ASH, "FORSINKET");
+  lv_obj_set_style_text_letter_space(usageStaleTag, 1, 0);
+  lv_obj_align(usageStaleTag, LV_ALIGN_TOP_RIGHT, -8, 8);
+  lv_obj_add_flag(usageStaleTag, LV_OBJ_FLAG_HIDDEN);
+}
+
+// Recomputes and applies every usage-zone row's fill width/color, pace-marker position,
+// pct text/color, and resets-in text - called once a second alongside the clock tick (see
+// loop()) so the pace marker and countdown stay live between fetches, not just on a new
+// fetch. period_pct (pace-marker position) is derived here from resetsAt + the known period
+// length + now, not read from the API - see fetchClaudeUsage()'s UsageLine comment.
+static void updateUsageZoneDisplay() {
+  time_t now   = time(nullptr);
+  bool   stale = (g_lastUsageFetchOkMs == 0) || (millis() - g_lastUsageFetchOkMs > USAGE_STALE_AFTER_MS);
+
+  if (stale) {
+    lv_obj_clear_flag(usageStaleTag, LV_OBJ_FLAG_HIDDEN);
+  } else {
+    lv_obj_add_flag(usageStaleTag, LV_OBJ_FLAG_HIDDEN);
+  }
+
+  static const int trackW = 200;
+  for (int i = 0; i < 3; i++) {
+    UsageLine& l = g_usageLines[i];
+    if (!l.haveData) {
+      lv_label_set_text(usagePct[i], "--%");
+      lv_label_set_text(usageReset[i], "");
+      lv_obj_set_width(usageFill[i], 2);
+      lv_obj_set_style_bg_color(usageFill[i], COLOR_USAGE_SURFACE, 0);
+      lv_obj_set_style_bg_grad_color(usageFill[i], COLOR_USAGE_SURFACE, 0);
+      continue;
+    }
+
+    long secsLeft = (long)(l.resetsAt - now);
+    if (secsLeft < 0) secsLeft = 0;
+    float periodPct = 100.0f * (1.0f - (float)secsLeft / (float)l.periodSeconds);
+    if (periodPct < 0.0f) periodPct = 0.0f;
+    if (periodPct > 100.0f) periodPct = 100.0f;
+
+    bool critical = l.pct >= 90.0f;
+    bool depleted = l.pct >= 100.0f;
+    bool overPace = !stale && l.pct > periodPct;
+
+    int fillW = (int)(trackW * l.pct / 100.0f);
+    if (fillW < 2) fillW = 2;
+    if (fillW > trackW) fillW = trackW;
+    lv_obj_set_width(usageFill[i], fillW);
+
+    lv_color_t fillStart = stale ? COLOR_USAGE_SURFACE : COLOR_USAGE_CORE;
+    lv_color_t fillEnd;
+    if (stale) {
+      fillEnd = COLOR_USAGE_ASH;
+    } else if (critical || overPace) {
+      fillEnd = COLOR_USAGE_ALERT;
+    } else {
+      fillEnd = COLOR_USAGE_HOT;
+    }
+    lv_obj_set_style_bg_color(usageFill[i], fillStart, 0);
+    lv_obj_set_style_bg_grad_color(usageFill[i], fillEnd, 0);
+
+    int markerX = (int)(trackW * periodPct / 100.0f) - 1;
+    if (markerX < 0) markerX = 0;
+    lv_obj_set_x(usageMarker[i], 32 + markerX); // 32 = labelW, see buildClockUi()
+
+    lv_label_set_text_fmt(usagePct[i], "%d%%", (int)(l.pct + 0.5f));
+    lv_obj_set_style_text_color(usagePct[i], (critical || depleted) ? COLOR_USAGE_ALERT : COLOR_USAGE_TEXT, 0);
+
+    // Danish "Xd Yt" (days/hours) or "Xt Ym" (hours/minutes), matching the handoff doc's
+    // "1t 51m" / "4d 9t" examples.
+    char resetBuf[24];
+    if (secsLeft >= 86400) {
+      snprintf(resetBuf, sizeof(resetBuf), "%ldd %ldt", secsLeft / 86400, (secsLeft % 86400) / 3600);
+    } else {
+      snprintf(resetBuf, sizeof(resetBuf), "%ldt %ldm", secsLeft / 3600, (secsLeft % 3600) / 60);
+    }
+    lv_label_set_text(usageReset[i], resetBuf);
+    bool depletedEmphasis = depleted && !stale;
+    lv_obj_set_style_text_color(usageReset[i], depletedEmphasis ? COLOR_USAGE_TEXT : COLOR_USAGE_ASH, 0);
+  }
 }
 
 // Shown only while the WiFiManager captive portal is open (see onConfigPortalStart()) -
@@ -706,11 +1024,18 @@ void setup() {
   wm.setSaveConfigCallback(onWifiConfigSaved);
 
   prefs.begin("pinecyd", true);
-  g_timezone = prefs.getString("tz", DEFAULT_TZ);
+  g_timezone    = prefs.getString("tz", DEFAULT_TZ);
+  g_claudeToken = prefs.getString("claude_tok", "");
   prefs.end();
   static WiFiManagerParameter tzParam("tz", "Timezone (POSIX TZ string)", g_timezone.c_str(), 63);
   pTzParam = &tzParam;
   wm.addParameter(&tzParam);
+  // Deliberately NOT pre-filled with g_claudeToken (see onWifiConfigSaved()'s comment) -
+  // type="password" masks entry in the UI; blank on save means "keep the existing token".
+  static WiFiManagerParameter tokenParam("claude_tok", "Claude usage token (blank = keep existing)", "", 400,
+                                          "type=\"password\"");
+  pTokenParam = &tokenParam;
+  wm.addParameter(&tokenParam);
 
   if (bootButtonHeld) {
     Serial.println("[BOOT] BOOT button held at boot - resetting stored WiFi config and forcing the portal");
@@ -823,6 +1148,7 @@ void loop() {
       Serial.printf("[WiFi] mDNS ready: http://%s.local/\n", OTA_HOSTNAME);
     }
     otaBegin();
+    if (!g_claudeToken.isEmpty()) fetchClaudeUsage(); // don't wait a full 60s for the first one
     if (g_wifiSsid.isEmpty()) {
       g_wifiSsid = WiFi.SSID();
       g_wifiPsk  = WiFi.psk();
@@ -850,7 +1176,26 @@ void loop() {
     struct tm timeinfo;
     if (getLocalTime(&timeinfo, 100)) {
       lv_label_set_text_fmt(label_clock_time, "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
+      static const char* DA_WEEKDAYS[7] = {"s\xC3\xB8n", "man", "tir", "ons", "tor", "fre", "l\xC3\xB8r"}; // tm_wday: 0=Sunday
+      static const char* DA_MONTHS[12]  = {"jan", "feb", "mar", "apr", "maj", "jun",
+                                            "jul", "aug", "sep", "okt", "nov", "dec"};
+      lv_label_set_text_fmt(label_clock_date, "%s %d. %s", DA_WEEKDAYS[timeinfo.tm_wday], timeinfo.tm_mday,
+                             DA_MONTHS[timeinfo.tm_mon]);
     }
+    // Recomputed every tick (not just on fetch) so the pace marker and countdown stay live
+    // between the 60s fetch cycles below - see updateUsageZoneDisplay()'s own comment.
+    updateUsageZoneDisplay();
+  }
+
+  // Claude usage fetch cadence (2026-07-15): only while the clock is showing (WiFi on) and
+  // a token has been configured. 60s, not tied to the clock tick above - usage doesn't need
+  // per-second freshness, and this keeps the two concerns (display refresh vs. network
+  // fetch) independently tunable.
+  static uint32_t lastUsageFetch = 0;
+  if (clockScreenActive && !g_claudeToken.isEmpty() && wifiNowConnected &&
+      millis() - lastUsageFetch >= USAGE_FETCH_INTERVAL_MS) {
+    lastUsageFetch = millis();
+    fetchClaudeUsage();
   }
 
   // Poll cycle: tip_temp every time, plus exactly one of the other five characteristics

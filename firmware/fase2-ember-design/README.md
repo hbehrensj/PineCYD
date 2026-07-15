@@ -327,6 +327,59 @@ no more jerks, once this shipped.
   cleanly; no `BROWNOUT` reset was logged (hadn't crossed that threshold), just visible
   voltage sag. Don't power a WiFi-enabled build from a laptop/hub USB port for real testing.
 
+### Claude usage zone on the clock screen (2026-07-15)
+
+Ported from a handoff doc originally written for a sibling project's ESPHome/LVGL-YAML +
+Home Assistant + MQTT stack (`docs/claude-usage-zone/`) - PineCYD
+has none of that infrastructure, so this is the direct-fetch equivalent: the device itself
+polls `https://api.anthropic.com/api/oauth/usage` (an undocumented endpoint used internally
+by Claude Code's own HUD) every 60s while the clock screen is showing, and renders three
+bars (5-hour, 7-day, 7-day-Sonnet utilization) beneath the clock - visual design (colors,
+geometry, the pace-marker/stale-state logic) ported 1:1 from that doc; the data plumbing is
+new, built for this project's own raw-LVGL/WiFi architecture instead of MQTT.
+
+**Security tradeoff, explicitly chosen by the user, not silently decided:** the safer
+design - a small bridge script on a trusted machine holding the OAuth token, publishing
+only sanitized percentages/reset-times for the device to poll - was offered and declined.
+The user's explicit choice: enter the token directly via the same WiFi captive portal
+(masked input, `Preferences`/NVS storage, never pre-filled back into the portal's HTML so
+the stored value is never re-exposed via view-source), matching how WiFi credentials and
+timezone are already configured. Real, accepted risks worth restating plainly:
+- This is a live OAuth access token for the user's own Anthropic account - full API access,
+  not scoped to just this usage endpoint.
+- **The token isn't refreshed.** The device stores a snapshot of whatever's pasted in; if
+  Anthropic's access tokens expire on the usual OAuth timescale (hours, not months), the
+  usage zone will start reporting "FORSINKET" (stale) until the token is manually
+  re-entered via the portal. Not yet measured how long a given token actually lasts in
+  practice - flag for whoever verifies this next.
+- Undocumented endpoint, not part of Anthropic's public API reference - could change or
+  disappear without notice.
+- HTTPS uses `WiFiClientSecure::setInsecure()` (no certificate pinning), matching this
+  project's OTA self-update precedent - acceptable for a hobby device, but worth knowing.
+
+**Not yet verified on real hardware.** The device went offline (USB/power disconnected)
+before this could be flashed. Specifically unverified:
+- Whether the clock/date/usage-zone vertical stack actually fits in 240px without overlap
+  or clipping - built using `lv_obj_align_to()` cascades specifically to avoid needing to
+  know the 72px custom font's exact rendered height up front (see `buildClockUi()`'s own
+  comment), but the total *does* still need to fit, which hasn't been confirmed.
+  Row spacing/positions may need tuning once actually seen.
+- Whether the Danish weekday abbreviations "søn"/"lør" (the two containing `ø`, U+00F8)
+  render correctly in the standard built-in `lv_font_montserrat_14` - this project has hit
+  exactly this class of missing-glyph bug before (bullet vs. middle-dot, see below); the
+  existing successful use of the degree sign (also Latin-1 Supplement) elsewhere in this
+  file suggests it likely will, but that's an inference, not a confirmation.
+- The actual fetch/parse/render cycle against a real token and a real response.
+- Heap/flash headroom under this combined load in practice, not just the static build
+  report below.
+
+**Flash headroom is now genuinely tight**: 93.8% of the 1.875MiB OTA slot (`partitions_ota.csv`)
+after adding ArduinoJson + HTTPClient + WiFiClientSecure on top of everything else - only
+~120KB of slot headroom left for any future addition. If that becomes a real constraint,
+the next lever is enlarging the OTA slots themselves (fewer than two would defeat OTA's own
+purpose) - which means another partition-table change and another mandatory USB reflash,
+same as the one `partitions_ota.csv` itself required.
+
 ## Bugs found and fixed along the way
 
 All found via real hardware, not caught by review or serial logs alone in most cases:

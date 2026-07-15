@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <meta name="design_doc_mode" content="canvas">
+  <style>
+    body { margin:0; background:#0b0908; }
+    * { box-sizing:border-box; }
+  </style>
+</helmet>
+
+<div style="display:flex; flex-wrap:wrap; gap:40px; padding:40px; align-items:flex-start; font-family:system-ui,-apple-system,'Segoe UI',sans-serif;">
+
+  <sc-for list="{{ frames }}" as="f" hint-placeholder-count="7">
+    <div style="display:flex; flex-direction:column; gap:10px; width:320px;">
+
+      <div style="display:flex; align-items:center; gap:8px;">
+        <span style="font-size:11px; font-weight:700; letter-spacing:0.06em; color:#8A7A6A; text-transform:uppercase;">{{ f.title }}</span>
+      </div>
+
+      <div style="position:relative; width:320px; height:240px; background:#14100C; overflow:hidden; border:1px solid #2a2018; border-radius:2px;">
+
+        <!-- clock -->
+        <div style="position:absolute; left:0; top:14px; width:320px; height:70px; display:flex; align-items:center; justify-content:center; font-size:60px; font-weight:700; color:#F2E7D8; letter-spacing:0.01em;">{{ f.time }}</div>
+
+        <!-- date -->
+        <div style="position:absolute; left:0; top:92px; width:320px; height:16px; text-align:center; font-size:14px; font-weight:500; color:#8A7A6A;">{{ f.date }}</div>
+
+        <!-- stale tag -->
+        <sc-if value="{{ f.stale }}" hint-placeholder-val="{{ false }}">
+          <div style="position:absolute; right:8px; top:8px; font-size:9px; font-weight:700; letter-spacing:0.08em; color:#8A7A6A;">FORSINKET</div>
+        </sc-if>
+
+        <!-- usage zone -->
+        <div style="position:absolute; left:8px; top:{{ f.zoneTop }}px; width:304px; height:112px;">
+          <sc-for list="{{ f.lines }}" as="line" hint-placeholder-count="3">
+            <div style="{{ line.rowStyle }}">
+              <div style="{{ line.labelStyle }}">{{ line.label }}</div>
+              <div style="{{ line.trackStyle }}">
+                <div style="{{ line.fillStyle }}"></div>
+                <div style="{{ line.markerStyle }}"></div>
+              </div>
+              <div style="{{ line.pctStyle }}">{{ line.pctText }}</div>
+              <div style="{{ line.resetStyle }}">{{ line.resetText }}</div>
+            </div>
+          </sc-for>
+        </div>
+
+      </div>
+
+      <div style="width:320px; font-size:11px; line-height:1.6; color:#8A7A6A; font-family:'SF Mono',ui-monospace,monospace;">{{ f.annotation }}</div>
+
+    </div>
+  </sc-for>
+
+</div>
+
+<template id="__bundler_thumbnail">
+  <svg viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+    <rect width="100" height="100" fill="#14100C"/>
+    <rect x="30" y="30" width="40" height="10" rx="5" fill="#241C14"/>
+    <rect x="30" y="30" width="24" height="10" rx="5" fill="#FF6A2B"/>
+    <text x="50" y="70" font-size="14" fill="#F2E7D8" text-anchor="middle" font-family="sans-serif">CYD</text>
+  </svg>
+</template>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script>
+const TOKENS = {
+  bg: '#14100C',
+  surface: '#241C14',
+  core: '#FF6A2B',
+  hot: '#FFB03A',
+  alert: '#FF3B2F',
+  ash: '#8A7A6A',
+  text: '#F2E7D8'
+};
+
+function fmtPct(p){ return p + '%'; }
+
+// builds one line's full style set given track geometry + state flags
+function buildLine(spec, rowH, trackW, labelW, pctW, gapAfterBar, stale, showReset){
+  const barH = spec.barH;
+  const markerH = barH + 4;
+  const overPace = spec.pct > spec.period_pct && !stale;
+  const critical = spec.pct >= 90;
+  const depleted = spec.pct >= 100;
+
+  const trackX = labelW;
+  const trackY = (rowH - barH) / 2 - (showReset ? 5 : 0);
+
+  const fillW = Math.max(2, Math.round(trackW * spec.pct / 100));
+  const markerX = Math.round(trackW * spec.period_pct / 100) - 1;
+
+  let fillEndColor = TOKENS.hot;
+  if (stale) fillEndColor = TOKENS.ash;
+  else if (critical || overPace) fillEndColor = TOKENS.alert;
+
+  let fillStartColor = stale ? TOKENS.surface : TOKENS.core;
+  const fillBg = stale
+    ? `linear-gradient(90deg, ${fillStartColor}, ${TOKENS.ash})`
+    : `linear-gradient(90deg, ${fillStartColor}, ${fillEndColor})`;
+
+  const rowStyle = `position:relative; width:${trackW+labelW+4+pctW}px; height:${rowH}px; margin-bottom:${gapAfterBar}px;`;
+  const labelStyle = `position:absolute; left:0; top:${(rowH - (showReset?18:barH))/2 - (showReset?4:0)}px; width:${labelW-4}px; height:16px; font-size:12px; font-weight:600; color:${TOKENS.ash}; display:flex; align-items:center;`;
+  const trackStyle = `position:absolute; left:${trackX}px; top:${trackY}px; width:${trackW}px; height:${barH}px; border-radius:${barH/2}px; background:${stale ? '#1c1712' : TOKENS.surface}; overflow:visible;`;
+  const fillStyle = `position:absolute; left:0; top:0; width:${fillW}px; height:${barH}px; border-radius:${barH/2}px; background:${fillBg};`;
+  const markerStyle = `position:absolute; left:${markerX}px; top:${-(markerH-barH)/2}px; width:2px; height:${markerH}px; background:${TOKENS.ash}; border-radius:1px;`;
+
+  const pctColor = (critical || depleted) ? TOKENS.alert : TOKENS.text;
+  const pctStyle = `position:absolute; right:0; top:${(rowH - (showReset?18:barH))/2 - (showReset?4:0)}px; width:${pctW-4}px; height:16px; text-align:right; font-size:13px; font-weight:700; color:${pctColor}; display:flex; align-items:center; justify-content:flex-end;`;
+
+  const resetColor = depleted ? TOKENS.text : TOKENS.ash;
+  const resetWeight = depleted ? 700 : 500;
+  const resetStyle = showReset
+    ? `position:absolute; right:0; top:${trackY + barH + 2}px; width:${trackW+pctW}px; text-align:right; font-size:10px; font-weight:${resetWeight}; color:${resetColor};`
+    : `display:none;`;
+
+  return { labelStyle, trackStyle, fillStyle, markerStyle, pctStyle, resetStyle, rowStyle };
+}
+
+function makeFrame(title, opts){
+  const { time='21:47', date='ons 15. jul', stale=false, lines, rowH, showReset=true } = opts;
+  const trackW = 200, labelW = 32, pctW = 40;
+  const n = lines.length;
+  const gap = n === 4 ? 6 : 8;
+  const totalH = n * rowH + (n - 1) * gap;
+  const zoneTop = 120 + Math.round((112 - totalH) / 2);
+
+  const builtLines = lines.map(l => {
+    const built = buildLine(l, rowH, trackW, labelW, pctW, gap, stale, showReset);
+    return {
+      label: l.label,
+      pctText: fmtPct(l.pct),
+      resetText: showReset ? l.resets_in : '',
+      ...built
+    };
+  });
+
+  // stack rows with gap using margin via wrapping container per-row not needed:
+  // rowStyle already sets width/height; position via simple flex container instead.
+  return {
+    title, time, date, stale, zoneTop,
+    lines: builtLines,
+    annotation: buildAnnotation(n, rowH, gap, trackW, labelW, pctW, stale)
+  };
+}
+
+function buildAnnotation(n, rowH, gap, trackW, labelW, pctW, stale){
+  return [
+    `linjer:${n}  raekkehojde:${rowH}px  gap:${gap}px`,
+    `bar-track: ${trackW}x${rowH<=24?14:16}px  radius:${(rowH<=24?7:8)}px  x=${labelW}`,
+    `label-kolonne:${labelW}px  pct-kolonne:${pctW}px`,
+    `fyld: ${stale ? 'ember-surface\u2192ember-ash (daempet)' : 'ember-core\u2192ember-hot/alert'}`,
+    `pace-markor: ember-ash 2px lodret, +2px overshoot top/bund`
+  ].join('\n');
+}
+
+class Component extends DCLogic {
+  renderVals(){
+    const frames = [];
+
+    // 1. Normal
+    frames.push(makeFrame('01 \u00b7 Normal (3 linjer)', {
+      rowH: 32,
+      lines: [
+        { label:'5T', pct:28, period_pct:45, resets_in:'1t 51m', barH:16 },
+        { label:'UGE', pct:34, period_pct:50, resets_in:'4d 9t', barH:16 },
+        { label:'SON', pct:20, period_pct:50, resets_in:'4d 9t', barH:16 }
+      ]
+    }));
+
+    // 2. Over pace
+    frames.push(makeFrame('02 \u00b7 Over pace', {
+      rowH: 32,
+      lines: [
+        { label:'5T', pct:42, period_pct:30, resets_in:'1t 51m', barH:16 },
+        { label:'UGE', pct:61, period_pct:38, resets_in:'4d 9t', barH:16 },
+        { label:'SON', pct:35, period_pct:38, resets_in:'4d 9t', barH:16 }
+      ]
+    }));
+
+    // 3. Kritisk
+    frames.push(makeFrame('03 \u00b7 Kritisk (\u226590%)', {
+      rowH: 32,
+      lines: [
+        { label:'5T', pct:42, period_pct:63, resets_in:'1t 51m', barH:16 },
+        { label:'UGE', pct:61, period_pct:60, resets_in:'4d 9t', barH:16 },
+        { label:'SON', pct:92, period_pct:60, resets_in:'4d 9t', barH:16 }
+      ]
+    }));
+
+    // 4. Opbrugt
+    frames.push(makeFrame('04 \u00b7 Opbrugt (100%)', {
+      rowH: 32,
+      lines: [
+        { label:'5T', pct:100, period_pct:70, resets_in:'1t 51m', barH:16 },
+        { label:'UGE', pct:61, period_pct:60, resets_in:'4d 9t', barH:16 },
+        { label:'SON', pct:35, period_pct:38, resets_in:'4d 9t', barH:16 }
+      ]
+    }));
+
+    // 5. Stale
+    frames.push(makeFrame('05 \u00b7 Stale data', {
+      stale: true,
+      rowH: 32,
+      lines: [
+        { label:'5T', pct:28, period_pct:45, resets_in:'1t 51m', barH:16 },
+        { label:'UGE', pct:34, period_pct:50, resets_in:'4d 9t', barH:16 },
+        { label:'SON', pct:20, period_pct:50, resets_in:'4d 9t', barH:16 }
+      ]
+    }));
+
+    // 6. 2 linjer
+    frames.push(makeFrame('06 \u00b7 2 linjer', {
+      rowH: 32,
+      lines: [
+        { label:'5T', pct:28, period_pct:45, resets_in:'1t 51m', barH:16 },
+        { label:'UGE', pct:34, period_pct:50, resets_in:'4d 9t', barH:16 }
+      ]
+    }));
+
+    // 7. 4 linjer
+    frames.push(makeFrame('07 \u00b7 4 linjer', {
+      rowH: 22,
+      lines: [
+        { label:'5T', pct:28, period_pct:45, resets_in:'1t 51m', barH:14 },
+        { label:'UGE', pct:61, period_pct:38, resets_in:'4d 9t', barH:14 },
+        { label:'SON', pct:35, period_pct:38, resets_in:'4d 9t', barH:14 },
+        { label:'OPUS', pct:92, period_pct:70, resets_in:'2d 3t', barH:14 }
+      ]
+    }));
+
+    return { frames };
+  }
+}
+
+</script>
+</body>
+</html>

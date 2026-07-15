@@ -473,10 +473,12 @@ struct UsageLine {
   bool        haveData;      // false until the first successful fetch
 };
 
-// 60s -> 5min, 2026-07-15: each fetch's TLS handshake needs ~32KB of heap (see
-// fetchClaudeUsage()'s comment) that can't be reduced on this core - the only lever left is
-// how often it's attempted at all. 5-minute-stale usage data is a fine tradeoff; a
-// heap-exhaustion crash is not.
+// Was dropped to 10s briefly, 2026-07-15, purely to iterate faster while actively testing
+// (repeated fetches were confirmed safe - heap stayed stable at ~59-61KB largest-free-block
+// across 4 back-to-back attempts). Reverted back to 5 minutes after confirming that
+// hammering the endpoint that often gets rate-limited (HTTP 429) within a few minutes -
+// good real-world confirmation that 5 min is the right production cadence, not just a
+// heap-safety guess.
 static const uint32_t USAGE_FETCH_INTERVAL_MS = 5 * 60 * 1000;
 static const uint32_t USAGE_STALE_AFTER_MS    = 15 * 60 * 1000; // 15 min, per the handoff doc's stale rule
 
@@ -600,7 +602,10 @@ static void fetchClaudeUsage() {
     if (util < 0 || !resetsAtStr[0]) continue;
     time_t resetsAt = parseIso8601Utc(resetsAtStr);
     if (resetsAt == 0) continue;
-    g_usageLines[i].pct      = util * 100.0f;
+    // Confirmed live, 2026-07-15: the real API returns utilization already as a percentage
+    // (e.g. 43.0 for 43%) - the original example payload the user supplied showed a 0-1
+    // fraction (0.42), which turned out not to match the live response. No *100 here.
+    g_usageLines[i].pct      = util;
     g_usageLines[i].resetsAt = resetsAt;
     g_usageLines[i].haveData = true;
     anyOk                    = true;

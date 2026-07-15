@@ -415,7 +415,25 @@ concurrent memory pressure, the failure could return - the fast-fail check means
 (a multi-second doomed connect attempt) if that happens. The originally-offered bridge-
 script alternative (a script on a trusted machine holds the token, device only polls plain-
 HTTP sanitized percentages, never does TLS at all) remains available as a fallback if this
-ever regresses.
+ever regresses. **Confirmed via a real rate-limit hit**: the fetch interval was briefly
+dropped to 10s purely to iterate faster while testing - within a few minutes Anthropic's API
+started returning `HTTP 429`, good real-world confirmation that 5 minutes is the right
+production cadence, not just a heap-safety guess.
+
+**Two more real bugs found and fixed once the fetch itself was reliable:**
+- **Percentages displayed 100x too large** ("4300%" instead of "43%"), and the bar fill
+  correspondingly clamped to always-100%-full. The original example payload the user
+  supplied showed `utilization` as a 0-1 fraction (`0.42`); the real live API returns it
+  already as a percentage (`43.0`). Fixed by removing the `* 100` conversion - trusted the
+  live response over the earlier illustrative example, same "verify, don't assume"
+  correction this project has made several times before.
+- **Visible color banding/stripes in the bar fill gradient**, confirmed live (not a photo/
+  camera moiré artifact - checked explicitly) and scaling with fill width. Root cause:
+  `LV_DITHER_GRADIENT` was `0` in `lv_conf.h` - naive per-pixel linear interpolation on a
+  16-bit RGB565 display without dithering is a well-known source of exactly this kind of
+  banding, and LVGL has a purpose-built option for it. Fixed by enabling ordered dithering
+  (not error-diffusion, cheaper and sufficient here) - costs ~800 bytes extra per gradient
+  draw for these ~200px-wide bars.
 
 **Flash headroom is now genuinely tight**: ~94% of the 1.875MiB OTA slot (`partitions_ota.csv`)
 after adding ArduinoJson + HTTPClient + WiFiClientSecure on top of everything else - only
@@ -423,6 +441,21 @@ after adding ArduinoJson + HTTPClient + WiFiClientSecure on top of everything el
 the next lever is enlarging the OTA slots themselves (fewer than two would defeat OTA's own
 purpose) - which means another partition-table change and another mandatory USB reflash,
 same as the one `partitions_ota.csv` itself required.
+
+**Planned next (not yet started), per the user, 2026-07-15:**
+1. Revisit WiFi+BLE running simultaneously (the on/off toggle was tested and reverted
+   tonight for cost with no benefit - but that test was specifically about the usage
+   fetch's memory problem, which is now fixed a different way; the *reason* to revisit is
+   item 2 below, a different motivation than tonight's failed experiment).
+2. A web page for configuring the Pinecil itself, reachable at `pinecyd.local` while a
+   Pinecil is connected (fast tip-temp reads aren't important on this page) - needs #1,
+   since WiFi is currently off exactly when a Pinecil is connected.
+3. Drop the numeric percentage text next to each bar - the bar fill alone is enough.
+4. Make the number of usage-zone rows genuinely dynamic from the JSON response (currently
+   hardcoded to exactly 3 pre-created rows matching today's known API shape - see
+   `g_usageLines[3]` in `main.cpp`), and show nothing at all (not empty placeholder bars)
+   when there's no token/no data - matches the original handoff doc's actual 2-4-row design
+   intent, which was simplified away when this was first built.
 
 ### Always-on settings page (2026-07-15)
 

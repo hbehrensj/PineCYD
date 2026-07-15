@@ -135,9 +135,10 @@ static const lv_color_t COLOR_MISTY_BLUE = LV_COLOR_MAKE(0x9B, 0xA2, 0xBC);
 // rather than reusing the nearest existing token. Screen background reuses COLOR_BLACK
 // (#0D0D0D) instead of the doc's ember-bg (#14100C) - close enough to not be worth a second
 // near-duplicate black, and keeps the clock screen consistent with the dashboard screen.
+// ember-hot (#FFB03A) dropped, 2026-07-15 - was only used as a gradient's leading-edge
+// color; the fill is a flat per-state color now (see updateUsageZoneDisplay()), no gradient.
 static const lv_color_t COLOR_USAGE_SURFACE = LV_COLOR_MAKE(0x24, 0x1C, 0x14);
 static const lv_color_t COLOR_USAGE_CORE    = LV_COLOR_MAKE(0xFF, 0x6A, 0x2B);
-static const lv_color_t COLOR_USAGE_HOT     = LV_COLOR_MAKE(0xFF, 0xB0, 0x3A);
 static const lv_color_t COLOR_USAGE_ALERT   = LV_COLOR_MAKE(0xFF, 0x3B, 0x2F);
 static const lv_color_t COLOR_USAGE_ASH     = LV_COLOR_MAKE(0x8A, 0x7A, 0x6A);
 static const lv_color_t COLOR_USAGE_TEXT    = LV_COLOR_MAKE(0xF2, 0xE7, 0xD8);
@@ -473,12 +474,11 @@ struct UsageLine {
   bool        haveData;      // false until the first successful fetch
 };
 
-// Was dropped to 10s briefly, 2026-07-15, purely to iterate faster while actively testing
-// (repeated fetches were confirmed safe - heap stayed stable at ~59-61KB largest-free-block
-// across 4 back-to-back attempts). Reverted back to 5 minutes after confirming that
-// hammering the endpoint that often gets rate-limited (HTTP 429) within a few minutes -
-// good real-world confirmation that 5 min is the right production cadence, not just a
-// heap-safety guess.
+// Production cadence. Was dropped to 10s, then 60s, at different points on 2026-07-15
+// purely to iterate faster while actively fixing rendering bugs (g_usageLines[] is RAM-only
+// so every reflash needs a fresh fetch before real data shows again). 10s got rate-limited
+// (HTTP 429) within minutes - concrete confirmation, not just a heap-safety guess, that 5
+// min is the right steady-state value.
 static const uint32_t USAGE_FETCH_INTERVAL_MS = 5 * 60 * 1000;
 static const uint32_t USAGE_STALE_AFTER_MS    = 15 * 60 * 1000; // 15 min, per the handoff doc's stale rule
 
@@ -863,17 +863,20 @@ static void buildClockUi() {
     lv_obj_set_style_pad_all(usageTrack[i], 0, 0);
     lv_obj_clear_flag(usageTrack[i], LV_OBJ_FLAG_SCROLLABLE);
 
-    // Fill is a separate stacked lv_obj, not a plain lv_bar - per-row gradient end-color
-    // needs to change (hot/alert/desaturated) depending on state, recomputed every refresh
-    // in updateUsageZoneDisplay(), which a single shared lv_bar style can't do per-instance
-    // as cheaply.
+    // Fill is a separate stacked lv_obj, not a plain lv_bar - per-row fill color needs to
+    // change (core/alert/desaturated) depending on state, recomputed every refresh in
+    // updateUsageZoneDisplay(), which a single shared lv_bar style can't do per-instance as
+    // cheaply. Originally a core->hot gradient per the handoff doc's design - dropped to a
+    // flat color, 2026-07-15, at the user's explicit request after real, visible gradient
+    // banding/striping couldn't be resolved (dithering and gradient caching were both tried
+    // live on real hardware, neither fixed it) - the user doesn't want the color-illustrates-
+    // usage gradient concept at all, a flat color per state is simpler and sidesteps the
+    // rendering issue entirely rather than continuing to chase it.
     usageFill[i] = lv_obj_create(usageZone);
     lv_obj_set_pos(usageFill[i], labelW, rowY + 3);
     lv_obj_set_size(usageFill[i], 2, barH);
     lv_obj_set_style_radius(usageFill[i], barH / 2, 0);
     lv_obj_set_style_bg_color(usageFill[i], COLOR_USAGE_CORE, 0);
-    lv_obj_set_style_bg_grad_color(usageFill[i], COLOR_USAGE_HOT, 0);
-    lv_obj_set_style_bg_grad_dir(usageFill[i], LV_GRAD_DIR_HOR, 0);
     lv_obj_set_style_bg_opa(usageFill[i], LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(usageFill[i], 0, 0);
     lv_obj_set_style_pad_all(usageFill[i], 0, 0);
@@ -927,7 +930,6 @@ static void updateUsageZoneDisplay() {
       lv_label_set_text(usageReset[i], "");
       lv_obj_set_width(usageFill[i], 2);
       lv_obj_set_style_bg_color(usageFill[i], COLOR_USAGE_SURFACE, 0);
-      lv_obj_set_style_bg_grad_color(usageFill[i], COLOR_USAGE_SURFACE, 0);
       continue;
     }
 
@@ -946,17 +948,16 @@ static void updateUsageZoneDisplay() {
     if (fillW > trackW) fillW = trackW;
     lv_obj_set_width(usageFill[i], fillW);
 
-    lv_color_t fillStart = stale ? COLOR_USAGE_SURFACE : COLOR_USAGE_CORE;
-    lv_color_t fillEnd;
+    // Flat fill color by state - no gradient (see buildClockUi()'s comment for why).
+    lv_color_t fillColor;
     if (stale) {
-      fillEnd = COLOR_USAGE_ASH;
+      fillColor = COLOR_USAGE_ASH;
     } else if (critical || overPace) {
-      fillEnd = COLOR_USAGE_ALERT;
+      fillColor = COLOR_USAGE_ALERT;
     } else {
-      fillEnd = COLOR_USAGE_HOT;
+      fillColor = COLOR_USAGE_CORE;
     }
-    lv_obj_set_style_bg_color(usageFill[i], fillStart, 0);
-    lv_obj_set_style_bg_grad_color(usageFill[i], fillEnd, 0);
+    lv_obj_set_style_bg_color(usageFill[i], fillColor, 0);
 
     int markerX = (int)(trackW * periodPct / 100.0f) - 1;
     if (markerX < 0) markerX = 0;

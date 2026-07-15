@@ -428,12 +428,18 @@ production cadence, not just a heap-safety guess.
   live response over the earlier illustrative example, same "verify, don't assume"
   correction this project has made several times before.
 - **Visible color banding/stripes in the bar fill gradient**, confirmed live (not a photo/
-  camera moiré artifact - checked explicitly) and scaling with fill width. Root cause:
-  `LV_DITHER_GRADIENT` was `0` in `lv_conf.h` - naive per-pixel linear interpolation on a
-  16-bit RGB565 display without dithering is a well-known source of exactly this kind of
-  banding, and LVGL has a purpose-built option for it. Fixed by enabling ordered dithering
-  (not error-diffusion, cheaper and sufficient here) - costs ~800 bytes extra per gradient
-  draw for these ~200px-wide bars.
+  camera moiré artifact - checked explicitly) and scaling with fill width. Two real fixes
+  were tried on real hardware and **neither actually resolved it**: enabling
+  `LV_DITHER_GRADIENT` (RGB565 gradients without dithering are a known banding source -
+  reasonable theory, didn't help) and enabling `LV_GRAD_CACHE_DEF_SIZE` (thinking the
+  every-second redraw's fresh malloc+free of the gradient map, through LVGL's "not_cached"
+  path, was corrupting something in its own now-smaller 20KB pool - also didn't help). Root
+  cause was never actually identified. **Resolved by dropping the gradient entirely** - the
+  user didn't want the design's original "color illustrates usage" gradient concept at all,
+  just a flat fill color per state (normal/alert/stale). Simpler, sidesteps the unsolved
+  rendering issue rather than continuing to chase it, and `LV_DITHER_GRADIENT`/
+  `LV_GRAD_CACHE_DEF_SIZE` were reverted back to their original defaults (`0`) since nothing
+  in this project draws a gradient any more.
 
 **Flash headroom is now genuinely tight**: ~94% of the 1.875MiB OTA slot (`partitions_ota.csv`)
 after adding ArduinoJson + HTTPClient + WiFiClientSecure on top of everything else - only

@@ -161,17 +161,18 @@
  *LV_GRAD_CACHE_DEF_SIZE sets the size of this cache in bytes.
  *If the cache is too small the map will be allocated only while it's required for the drawing.
  *0 mean no caching.*/
+/* Briefly raised to 4096 and LV_DITHER_GRADIENT to 1, 2026-07-15, chasing real, visible
+   (confirmed not photo moire) banding/stripes in the usage-zone bar fill - neither fixed
+   it. Root cause never fully identified; moot now, since the fill dropped the gradient
+   entirely in favor of a flat per-state color at the user's request (see
+   updateUsageZoneDisplay() in main.cpp) - back to defaults since nothing in this project
+   uses a gradient any more. */
 #define LV_GRAD_CACHE_DEF_SIZE 0
 
 /*Allow dithering the gradients (to achieve visual smooth color gradients on limited color depth display)
  *LV_DITHER_GRADIENT implies allocating one or two more lines of the object's rendering surface
  *The increase in memory consumption is (32 bits * object width) plus 24 bits * object width if using error diffusion */
-/* 0 -> 1, 2026-07-15: real, visible (not photo-moire, confirmed live) color banding/stripes
-   in the usage-zone bar fill gradient - a direct RGB565 (16-bit color) artifact from naive
-   per-pixel linear interpolation with no dithering, exactly what this option exists to fix.
-   Ordered dithering (not error diffusion - LV_DITHER_ERROR_DIFFUSION stays 0), cheaper and
-   sufficient for a ~200px-wide bar; costs ~800 bytes extra per gradient draw. */
-#define LV_DITHER_GRADIENT 1
+#define LV_DITHER_GRADIENT 0
 #if LV_DITHER_GRADIENT
     /*Add support for error diffusion dithering.
      *Error diffusion dithering gets a much better visual result, but implies more CPU consumption and memory when drawing.

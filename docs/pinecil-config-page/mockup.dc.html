@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<style>
+  body { margin: 0; box-sizing: border-box; }
+  * { box-sizing: border-box; }
+  a { color: #FF6A2B; }
+  a:hover { color: #FF8F5C; }
+  input[type="range"] { accent-color: #FF6A2B; }
+</style>
+</helmet>
+<div style="min-height:100vh;display:flex;flex-direction:column;background:#0D0D0D;color:#F2E7D8;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif">
+
+  <div style="position:sticky;top:0;background:#241C14;border-bottom:1px solid rgba(242,231,216,0.1);padding:16px 24px;display:flex;justify-content:space-between;align-items:center;z-index:10">
+    <div>
+      <div style="font-size:18px;font-weight:600;color:#F2E7D8">Pinecil Settings</div>
+      <div style="font-size:12px;color:#8A7A6A;margin-top:2px">pinecyd.local/pinecil</div>
+    </div>
+    <div style="display:flex;align-items:center;gap:8px">
+      <div style="width:8px;height:8px;border-radius:50%;background:#FF6A2B"></div>
+      <span style="font-size:13px;color:#8A7A6A">Connected</span>
+    </div>
+  </div>
+
+  <div style="display:flex;gap:8px;padding:12px 24px;overflow-x:auto;border-bottom:1px solid rgba(242,231,216,0.08)">
+    <sc-for list="{{ tabs }}" as="tab" hint-placeholder-count="5">
+      <button onClick="{{ tab.onClick }}" style="{{ tab.buttonStyle }}">{{ tab.label }}</button>
+    </sc-for>
+  </div>
+
+  <div style="flex:1;max-width:760px;width:100%;margin:0 auto;padding:8px 24px 32px">
+
+    <sc-if value="{{ showAdvancedBanner }}" hint-placeholder-val="{{ false }}">
+      <div style="border:1px solid rgba(255,59,47,0.4);background:rgba(255,59,47,0.08);border-radius:8px;padding:16px;margin:16px 0">
+        <div style="color:#FF6A2B;font-weight:600;font-size:14px;margin-bottom:6px">Calibration fields</div>
+        <div style="color:#F2E7D8;font-size:13px;line-height:1.5;margin-bottom:12px">These fields control hardware calibration. Incorrect values can make temperature and voltage readings inaccurate. Only touch these if you know what you're doing.</div>
+        <button onClick="{{ onRevealAdvanced }}" style="background:transparent;border:1px solid #FF6A2B;color:#FF6A2B;padding:8px 14px;border-radius:6px;font-size:13px;cursor:pointer">Show calibration fields</button>
+      </div>
+    </sc-if>
+
+    <sc-for list="{{ sections }}" as="section" hint-placeholder-count="3">
+      <div style="margin-bottom:8px">
+        <h3 style="font-size:12px;text-transform:uppercase;letter-spacing:0.08em;color:#8A7A6A;font-weight:600;margin:24px 0 4px">{{ section.title }}</h3>
+        <sc-for list="{{ section.fields }}" as="field" hint-placeholder-count="4">
+          <div style="display:flex;flex-wrap:wrap;gap:16px;justify-content:space-between;align-items:flex-start;padding:14px 0;border-bottom:1px solid rgba(242,231,216,0.08)">
+            <div style="flex:1 1 220px;min-width:200px">
+              <div style="font-size:14px;color:#F2E7D8;font-weight:500">{{ field.label }}</div>
+              <sc-if value="{{ field.note }}" hint-placeholder-val="{{ false }}">
+                <div style="font-size:12px;color:#8A7A6A;margin-top:4px;line-height:1.4;max-width:420px">{{ field.note }}</div>
+              </sc-if>
+            </div>
+            <div style="flex:0 0 auto;min-width:120px;display:flex;align-items:center;gap:8px">
+              <sc-if value="{{ field.isNumber }}" hint-placeholder-val="{{ true }}">
+                <input type="number" value="{{ field.displayValue }}" min="{{ field.displayMin }}" max="{{ field.displayMax }}" step="{{ field.step }}" onChange="{{ field.onChangeNumber }}" style="width:90px;background:#0D0D0D;border:1px solid rgba(242,231,216,0.2);color:#F2E7D8;padding:8px 10px;border-radius:6px;font-size:14px;font-family:ui-monospace,monospace" />
+                <span style="font-size:13px;color:#8A7A6A;min-width:36px">{{ field.unitLabel }}</span>
+              </sc-if>
+              <sc-if value="{{ field.isSlider }}" hint-placeholder-val="{{ false }}">
+                <input type="range" value="{{ field.value }}" min="{{ field.min }}" max="{{ field.max }}" step="{{ field.step }}" onChange="{{ field.onChangeNumber }}" style="width:140px" />
+                <span style="font-size:13px;color:#F2E7D8;min-width:24px;font-family:ui-monospace,monospace;text-align:right">{{ field.value }}</span>
+              </sc-if>
+              <sc-if value="{{ field.isSelect }}" hint-placeholder-val="{{ false }}">
+                <select value="{{ field.value }}" onChange="{{ field.onChangeSelect }}" style="min-width:180px;background:#0D0D0D;border:1px solid rgba(242,231,216,0.2);color:#F2E7D8;padding:8px 10px;border-radius:6px;font-size:14px">
+                  <sc-for list="{{ field.options }}" as="opt" hint-placeholder-count="3">
+                    <option value="{{ opt.value }}">{{ opt.label }}</option>
+                  </sc-for>
+                </select>
+              </sc-if>
+              <sc-if value="{{ field.isToggle }}" hint-placeholder-val="{{ false }}">
+                <div onClick="{{ field.onToggle }}" style="{{ field.toggleTrackStyle }}">
+                  <div style="{{ field.toggleKnobStyle }}"></div>
+                </div>
+              </sc-if>
+              <sc-if value="{{ field.isReadonly }}" hint-placeholder-val="{{ false }}">
+                <span style="font-size:14px;color:#8A7A6A;font-family:ui-monospace,monospace">{{ field.value }}</span>
+              </sc-if>
+              <sc-if value="{{ field.isDisabledFixed }}" hint-placeholder-val="{{ false }}">
+                <input type="text" value="{{ field.value }}" disabled="{{ true }}" style="width:90px;background:#1a1512;border:1px solid rgba(242,231,216,0.1);color:#8A7A6A;padding:8px 10px;border-radius:6px;font-size:14px;font-family:ui-monospace,monospace" />
+              </sc-if>
+            </div>
+          </div>
+        </sc-for>
+      </div>
+    </sc-for>
+  </div>
+
+  <div style="position:sticky;bottom:0;background:#241C14;border-top:1px solid rgba(242,231,216,0.1);padding:14px 24px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;z-index:10">
+    <div style="font-size:13px;color:#8A7A6A">{{ footerStatusText }}</div>
+    <div style="display:flex;gap:10px">
+      <button onClick="{{ onDiscard }}" style="{{ discardButtonStyle }}">Discard</button>
+      <button onClick="{{ onSave }}" style="{{ saveButtonStyle }}">{{ saveButtonLabel }}</button>
+    </div>
+  </div>
+
+  <sc-if value="{{ toast }}" hint-placeholder-val="{{ false }}">
+    <div style="position:fixed;bottom:80px;left:50%;transform:translateX(-50%);background:#FF6A2B;color:#0D0D0D;padding:10px 18px;border-radius:20px;font-size:13px;font-weight:600;box-shadow:0 4px 16px rgba(0,0,0,0.4);z-index:20">{{ toast }}</div>
+  </sc-if>
+
+  <sc-if value="{{ showDisconnected }}" hint-placeholder-val="{{ false }}">
+    <div style="position:fixed;inset:0;background:#0D0D0D;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;z-index:50;text-align:center;padding:24px">
+      <div style="width:12px;height:12px;border-radius:50%;background:#FF3B2F"></div>
+      <div style="font-size:18px;color:#F2E7D8;font-weight:600">No Pinecil connected</div>
+      <div style="font-size:14px;color:#8A7A6A;max-width:320px">Connect a Pinecil V2 via BLE to PineCYD to read and change its settings.</div>
+      <div style="font-size:13px;color:#8A7A6A;font-family:ui-monospace,monospace">Retrying in {{ reconnectSeconds }}s…</div>
+    </div>
+  </sc-if>
+
+</div>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:900,&quot;height&quot;:800},&quot;connected&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Demo&quot;}}">
+const FIELDS = [
+  {key:'solderingTemp', tab:'soldering', section:'Setpoint', label:'Soldering temperature', type:'number', min:10, max:450, step:1, unit:'C', default:320, note:'The setpoint — shown read-only on the main dashboard'},
+  {key:'boostTemp', tab:'soldering', section:'Setpoint', label:'Boost temperature', type:'number', min:250, max:450, step:1, unit:'C', default:420, note:'Target in boost mode'},
+  {key:'temperatureInF', tab:'soldering', section:'Setpoint', label:'Show in Fahrenheit', type:'toggle', default:0, note:'Converts all temperature fields in this UI'},
+  {key:'tempChangeShortStep', tab:'soldering', section:'Buttons', label:'Short-press step', type:'number', min:1, max:50, step:1, unit:'°', default:1},
+  {key:'tempChangeLongStep', tab:'soldering', section:'Buttons', label:'Long-press step', type:'number', min:5, max:90, step:1, unit:'°', default:10},
+  {key:'reverseButtonTempChangeEnabled', tab:'soldering', section:'Buttons', label:'Swap +/- buttons', type:'toggle', default:0},
+  {key:'autoStartMode', tab:'soldering', section:'Startup & lock', label:'Auto-start', type:'select', default:0, options:[{value:0,label:'None'},{value:1,label:'Soldering'},{value:2,label:'Sleep temp'},{value:3,label:'Zero power'}]},
+  {key:'lockingMode', tab:'soldering', section:'Startup & lock', label:'Button lock', type:'select', default:0, options:[{value:0,label:'Off'},{value:1,label:'Boost only'},{value:2,label:'Full'}]},
+  {key:'powerLimit', tab:'soldering', section:'Startup & lock', label:'Power limit', type:'number', min:0, max:120, step:5, unit:'W', default:0, note:'0 = no limit'},
+
+  {key:'sleepTemp', tab:'sleep', section:'Sleep', label:'Sleep temperature', type:'number', min:10, max:450, step:1, unit:'C', default:150},
+  {key:'sleepTime', tab:'sleep', section:'Sleep', label:'Time to sleep', type:'number', min:0, max:15, step:1, unit:'raw', default:5, note:'Unit unconfirmed — sources disagree on minutes vs. raw×10 seconds. Verify on hardware before locking this label in.'},
+  {key:'shutdownTime', tab:'sleep', section:'Sleep', label:'Time to shutdown', type:'number', min:0, max:60, step:1, unit:'min', default:10},
+  {key:'coolingTempBlink', tab:'sleep', section:'Sleep', label:'Blink temp while cooling', type:'toggle', default:1, note:'Below 50°C'},
+  {key:'sensitivity', tab:'sleep', section:'Sensors', label:'Motion sensitivity', type:'slider', min:0, max:9, step:1, default:7},
+  {key:'hallEffectSensitivity', tab:'sleep', section:'Sensors', label:'Hall-effect sensitivity', type:'slider', min:0, max:9, step:1, default:7},
+  {key:'hallEffectSleepTime', tab:'sleep', section:'Sensors', label:'Time to sleep (magnet)', type:'number', min:0, max:12, step:1, unit:'×5s', default:0},
+
+  {key:'minDCVoltageCells', tab:'power', section:'Power source', label:'Power source type', type:'select', default:0, options:[{value:0,label:'DC (fixed 9V floor)'},{value:1,label:'3S battery'},{value:2,label:'4S battery'},{value:3,label:'5S battery'},{value:4,label:'6S battery'}]},
+  {key:'minVoltageCells', tab:'power', section:'Power source', label:'Min. voltage per cell', type:'number', min:24, max:38, step:1, unit:'×0.1V', default:33, note:'Combines with power source type into an effective cutoff voltage'},
+  {key:'qcIdealVoltage', tab:'power', section:'Power source', label:'QC ideal voltage', type:'number', min:90, max:220, step:2, unit:'×0.1V', default:90},
+  {key:'pdNegTimeout', tab:'power', section:'Power source', label:'PD negotiation timeout', type:'number', min:0, max:50, step:1, unit:'×100ms', default:20},
+  {key:'usbPDMode', tab:'power', section:'Power source', label:'USB PD mode', type:'select', default:0, options:[{value:0,label:'Fixed PDO only'},{value:1,label:'PPS+EPR+extra power'},{value:2,label:'PPS+EPR safe'}]},
+  {key:'keepAwakePulse', tab:'power', section:'Keep-awake pulse', label:'Pulse power', type:'number', min:0, max:100, step:1, unit:'×0.1W', default:0},
+  {key:'keepAwakePulseWait', tab:'power', section:'Keep-awake pulse', label:'Wait between pulses', type:'number', min:1, max:9, step:1, unit:'×2.5s', default:4},
+  {key:'keepAwakePulseDuration', tab:'power', section:'Keep-awake pulse', label:'Pulse duration', type:'number', min:1, max:9, step:1, unit:'×250ms', default:1},
+
+  {key:'orientationMode', tab:'display', section:'Display', label:'Orientation', type:'select', default:2, options:[{value:0,label:'Right'},{value:1,label:'Left'},{value:2,label:'Auto'}]},
+  {key:'oledBrightness', tab:'display', section:'Display', label:'Brightness', type:'slider', min:1, max:101, step:25, default:26},
+  {key:'oledInversion', tab:'display', section:'Display', label:'Invert colors', type:'toggle', default:0},
+  {key:'logoTime', tab:'display', section:'Display', label:'Boot logo duration', type:'number', min:0, max:6, step:1, unit:'s', default:1},
+  {key:'descriptionScrollSpeed', tab:'display', section:'Display', label:'Fast description scroll', type:'toggle', default:0},
+  {key:'detailedIDLE', tab:'display', section:'Screens', label:'Detailed idle screen', type:'toggle', default:1},
+  {key:'detailedSoldering', tab:'display', section:'Screens', label:'Detailed soldering screen', type:'toggle', default:1},
+  {key:'animationLoop', tab:'display', section:'Screens', label:'Loop animation', type:'toggle', default:1},
+  {key:'animationSpeed', tab:'display', section:'Screens', label:'Animation speed', type:'select', default:2, options:[{value:0,label:'Off'},{value:1,label:'Slow'},{value:2,label:'Medium'},{value:3,label:'Fast'}]},
+  {key:'uiLanguage', tab:'display', section:'Screens', label:'Language code (raw)', type:'number', min:0, max:65535, step:1, default:1033, note:'Raw 16-bit code — needs a lookup table to show a human-readable language name'},
+
+  {key:'voltageDiv', tab:'advanced', section:'Calibration', gated:true, label:'Voltage calibration', type:'number', min:360, max:900, step:1, default:630, note:'Hardware calibration factor from the schematic — only change if you know what you\u2019re doing'},
+  {key:'calibrationOffset', tab:'advanced', section:'Calibration', gated:true, label:'Tip ADC offset', type:'number', min:100, max:2500, step:1, unit:'µV', default:900, note:'Tip-specific calibration value'},
+  {key:'calibrateCJC', tab:'advanced', section:'Calibration', gated:true, label:'Trigger CJC calibration on next boot', type:'toggle', default:0, note:'A one-time action, not a persistent setting'},
+  {key:'solderingTipType', tab:'advanced', section:'Calibration', gated:true, label:'Tip type', type:'disabled', default:0, note:'Only one valid value on this hardware — auto tip detection is active'},
+  {key:'accelMissingWarningCounter', tab:'advanced', section:'Diagnostics (read-only)', label:'Warnings: missing accelerometer', type:'readonly', default:0},
+  {key:'pdMissingWarningCounter', tab:'advanced', section:'Diagnostics (read-only)', label:'Warnings: missing PD interface', type:'readonly', default:0},
+];
+
+const TAB_LIST = [
+  {key:'soldering', label:'Soldering'},
+  {key:'sleep', label:'Sleep'},
+  {key:'power', label:'Power'},
+  {key:'display', label:'Display'},
+  {key:'advanced', label:'Advanced'},
+];
+
+function cToF(c) { return Math.round(c * 9 / 5 + 32); }
+function fToC(f) { return Math.round((f - 32) * 5 / 9); }
+
+class Component extends DCLogic {
+  state = (() => {
+    const values = {};
+    FIELDS.forEach(f => { values[f.key] = f.default; });
+    return {
+      values,
+      savedValues: { ...values },
+      activeTab: 'soldering',
+      advancedRevealed: false,
+      saving: false,
+      toast: null,
+      reconnectSeconds: 5,
+    };
+  })();
+
+  componentDidMount() {
+    this._reconnectInterval = setInterval(() => {
+      if ((this.props.connected ?? true)) return;
+      this.setState(s => ({ reconnectSeconds: s.reconnectSeconds <= 1 ? 5 : s.reconnectSeconds - 1 }));
+    }, 1000);
+  }
+
+  componentWillUnmount() {
+    if (this._reconnectInterval) clearInterval(this._reconnectInterval);
+    if (this._toastTimeout) clearTimeout(this._toastTimeout);
+  }
+
+  setFieldValue(key, val) {
+    this.setState(s => ({ values: { ...s.values, [key]: val } }));
+  }
+
+  handleSave() {
+    this.setState({ saving: true });
+    setTimeout(() => {
+      this.setState(s => {
+        const n = Object.keys(s.values).filter(k => s.values[k] !== s.savedValues[k]).length;
+        if (this._toastTimeout) clearTimeout(this._toastTimeout);
+        this._toastTimeout = setTimeout(() => this.setState({ toast: null }), 2200);
+        return { saving: false, savedValues: { ...s.values }, toast: n > 0 ? `Saved ${n} change${n === 1 ? '' : 's'} to the Pinecil` : 'No changes to save' };
+      });
+    }, 700);
+  }
+
+  handleDiscard() {
+    this.setState(s => ({ values: { ...s.savedValues } }));
+  }
+
+  renderVals() {
+    const { values, savedValues, activeTab, advancedRevealed, saving, toast, reconnectSeconds } = this.state;
+    const connected = this.props.connected ?? true;
+    const tempUnitF = values.temperatureInF === 1;
+
+    const tabs = TAB_LIST.map(t => ({
+      key: t.key,
+      label: t.label,
+      onClick: () => this.setState({ activeTab: t.key }),
+      buttonStyle: {
+        padding: '8px 16px', borderRadius: '999px', border: 'none', fontSize: '13px', fontWeight: 600,
+        cursor: 'pointer', whiteSpace: 'nowrap',
+        background: activeTab === t.key ? '#FF6A2B' : 'transparent',
+        color: activeTab === t.key ? '#0D0D0D' : '#8A7A6A',
+      },
+    }));
+
+    const activeFields = FIELDS.filter(f => f.tab === activeTab && (!f.gated || advancedRevealed));
+    const sectionOrder = [];
+    const sectionMap = {};
+    activeFields.forEach(f => {
+      if (!sectionMap[f.section]) { sectionMap[f.section] = []; sectionOrder.push(f.section); }
+      const value = values[f.key];
+      const isTemp = f.unit === 'C';
+      const displayValue = isTemp && tempUnitF ? cToF(value) : value;
+      const displayMin = isTemp && tempUnitF ? cToF(f.min) : f.min;
+      const displayMax = isTemp && tempUnitF ? cToF(f.max) : f.max;
+      const unitLabel = isTemp ? (tempUnitF ? '°F' : '°C') : (f.unit || '');
+      const onChangeNumber = (e) => {
+        const raw = parseFloat(e.target.value);
+        if (Number.isNaN(raw)) return;
+        this.setFieldValue(f.key, isTemp && tempUnitF ? fToC(raw) : raw);
+      };
+      const onChangeSelect = (e) => this.setFieldValue(f.key, parseInt(e.target.value, 10));
+      const isOn = value === 1;
+      const onToggle = () => this.setFieldValue(f.key, isOn ? 0 : 1);
+      const toggleTrackStyle = {
+        width: '44px', height: '24px', borderRadius: '12px', cursor: 'pointer', position: 'relative',
+        background: isOn ? '#FF6A2B' : '#3a3128', transition: 'background 0.15s',
+      };
+      const toggleKnobStyle = {
+        width: '18px', height: '18px', borderRadius: '50%', background: '#F2E7D8', position: 'absolute',
+        top: '3px', left: isOn ? '23px' : '3px', transition: 'left 0.15s',
+      };
+      sectionMap[f.section].push({
+        ...f, value, displayValue, displayMin, displayMax, unitLabel, onChangeNumber, onChangeSelect, onToggle,
+        toggleTrackStyle, toggleKnobStyle,
+        isNumber: f.type === 'number', isSlider: f.type === 'slider', isSelect: f.type === 'select',
+        isToggle: f.type === 'toggle', isReadonly: f.type === 'readonly', isDisabledFixed: f.type === 'disabled',
+      });
+    });
+    const sections = sectionOrder.map(title => ({ title, fields: sectionMap[title] }));
+
+    const hasGatedInTab = FIELDS.some(f => f.tab === activeTab && f.gated);
+    const showAdvancedBanner = activeTab === 'advanced' && hasGatedInTab && !advancedRevealed;
+
+    const dirtyCount = Object.keys(values).filter(k => values[k] !== savedValues[k]).length;
+    const isDirty = dirtyCount > 0;
+
+    return {
+      tabs, sections, showAdvancedBanner,
+      onRevealAdvanced: () => this.setState({ advancedRevealed: true }),
+      footerStatusText: isDirty ? `${dirtyCount} change${dirtyCount === 1 ? '' : 's'} not saved` : 'All changes saved',
+      onSave: () => this.handleSave(),
+      onDiscard: () => this.handleDiscard(),
+      saveButtonLabel: saving ? 'Saving…' : 'Save changes',
+      saveButtonStyle: {
+        padding: '10px 20px', borderRadius: '6px', border: 'none', fontSize: '14px', fontWeight: 600,
+        cursor: isDirty && !saving ? 'pointer' : 'default',
+        background: isDirty && !saving ? '#FF6A2B' : '#3a3128',
+        color: isDirty && !saving ? '#0D0D0D' : '#8A7A6A',
+      },
+      discardButtonStyle: {
+        padding: '10px 18px', borderRadius: '6px', fontSize: '14px', fontWeight: 500,
+        background: 'transparent', border: '1px solid rgba(242,231,216,0.2)',
+        color: isDirty ? '#F2E7D8' : '#8A7A6A', cursor: isDirty ? 'pointer' : 'default',
+      },
+      toast,
+      showDisconnected: !connected,
+      reconnectSeconds,
+    };
+  }
+}
+
+</script>
+</body>
+</html>

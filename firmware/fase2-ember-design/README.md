@@ -329,6 +329,12 @@ no more jerks, once this shipped.
 
 ### Claude usage zone on the clock screen (2026-07-15)
 
+**Historical note (read this first): the on-device-OAuth-token design described in most of
+this section was superseded the very next day by a bridge-script architecture - see "Moved
+to a bridge architecture" further down. The device today never stores or sees an access
+token at all.** Kept in full below as a real record of what was tried, what broke, and why -
+skip ahead if you only want the current design.
+
 Ported from a handoff doc originally written for a sibling project's ESPHome/LVGL-YAML +
 Home Assistant + MQTT stack (`docs/claude-usage-zone/`) - PineCYD
 has none of that infrastructure, so this is the direct-fetch equivalent: the device itself
@@ -338,7 +344,8 @@ bars (5-hour, 7-day, 7-day-Sonnet utilization) beneath the clock - visual design
 geometry, the pace-marker/stale-state logic) ported 1:1 from that doc; the data plumbing is
 new, built for this project's own raw-LVGL/WiFi architecture instead of MQTT.
 
-**Security tradeoff, explicitly chosen by the user, not silently decided:** the safer
+**Security tradeoff, explicitly chosen by the user at the time, later reversed (see above) -
+not silently decided either way:** the safer
 design - a small bridge script on a trusted machine holding the OAuth token, publishing
 only sanitized percentages/reset-times for the device to poll - was offered and declined.
 The user's explicit choice: enter the token directly via the same WiFi captive portal
@@ -420,6 +427,32 @@ dropped to 10s purely to iterate faster while testing - within a few minutes Ant
 started returning `HTTP 429`, good real-world confirmation that 5 minutes is the right
 production cadence, not just a heap-safety guess.
 
+**The exact same failure came back the *next* day, 2026-07-15/16, with the fetch itself
+producing no data on screen again** - real root cause turned out to be a **stale build
+cache**, not a regression in the fix above. `lv_conf.h` on disk correctly still said
+`LV_MEM_SIZE (20U * 1024U)`, but the *running* firmware's `lv_mem_monitor()` reported a
+40960-byte (40KB) pool - PlatformIO's incremental build hadn't recompiled the LVGL library
+object that embeds `LV_MEM_SIZE` since an earlier point in that file's edit history, so the
+device had likely been running on the old 40KB pool for some time despite every `pio run`
+in between reporting success. `pio run -t clean` + rebuild dropped reported RAM usage by
+exactly ~20KB (120640 -> 100160 bytes) and confirmed it - after reflashing, largest
+contiguous free block went from a reproducible, stuck-at ~45KB (just above the fast-fail
+floor but still too little for the handshake's X.509/BIGNUM overhead once past the raw 32KB
+buffers) up to **65524 bytes**, and TLS handshakes succeeded again. Also newly observed:
+even one HTTPS attempt (success *or* failure) visibly fragments the heap afterward
+(`largest_block` dropped from 65524 to ~41-43KB immediately after), but - unlike the stale-
+pool state - it now reliably *recovers* back to 65524 within about one heartbeat (10s)
+rather than staying stuck low, so it's no longer a threat to the next cycle's attempt.
+**Lesson for next time a `LV_*` or other library-header-only config value changes: always
+`pio run -t clean` before trusting a subsequent build/flash, not just after a config edit
+made in the same sitting** - the normal incremental build gave no error or warning that it
+had silently kept using the old value.
+
+`USAGE_FETCH_MIN_CONTIGUOUS_HEAP` was raised `36864 -> 49152` during this same debugging
+session (based on the stale-pool-era 45044-byte failure) and left at that value - it's
+comfortably below the now-healthy 65524-byte baseline, so it doesn't block real fetches, and
+gives a bit more margin than the original 36864 in case fragmentation patterns shift again.
+
 **Two more real bugs found and fixed once the fetch itself was reliable:**
 - **Percentages displayed 100x too large** ("4300%" instead of "43%"), and the bar fill
   correspondingly clamped to always-100%-full. The original example payload the user
@@ -448,20 +481,98 @@ the next lever is enlarging the OTA slots themselves (fewer than two would defea
 purpose) - which means another partition-table change and another mandatory USB reflash,
 same as the one `partitions_ota.csv` itself required.
 
-**Planned next (not yet started), per the user, 2026-07-15:**
-1. Revisit WiFi+BLE running simultaneously (the on/off toggle was tested and reverted
-   tonight for cost with no benefit - but that test was specifically about the usage
-   fetch's memory problem, which is now fixed a different way; the *reason* to revisit is
-   item 2 below, a different motivation than tonight's failed experiment).
-2. A web page for configuring the Pinecil itself, reachable at `pinecyd.local` while a
-   Pinecil is connected (fast tip-temp reads aren't important on this page) - needs #1,
-   since WiFi is currently off exactly when a Pinecil is connected.
-3. Drop the numeric percentage text next to each bar - the bar fill alone is enough.
-4. Make the number of usage-zone rows genuinely dynamic from the JSON response (currently
-   hardcoded to exactly 3 pre-created rows matching today's known API shape - see
-   `g_usageLines[3]` in `main.cpp`), and show nothing at all (not empty placeholder bars)
-   when there's no token/no data - matches the original handoff doc's actual 2-4-row design
-   intent, which was simplified away when this was first built.
+**Usage-zone row count made dynamic (2026-07-15):** all 3 buckets (`five_hour`/`seven_day`/
+`seven_day_sonnet`) are still pre-created LVGL objects (fixed flash cost, matching the
+handoff doc's own suggested "pre-declare + hide unused" approach), but
+`updateUsageZoneDisplay()` now decides visibility/position at runtime from `haveData` per
+line: missing buckets are skipped entirely (no "--%" placeholder row), the visible rows are
+compacted with no gap where a missing one would be, and the whole stack is re-centered
+within the fixed row-count budget - matching the handoff doc's "fewer rows = more centered
+whitespace" 2-line spec. If no bucket has ever had data (no token configured yet, or the
+first fetch hasn't completed), the entire usage zone - and the stale tag - stay hidden
+instead of showing empty placeholder bars. Not yet re-tested against a token that's actually
+missing one of the three buckets (the account this was verified against always returns all
+three) - the skip-and-compact logic is exercised today only by the "no token at all" case,
+worth confirming with a partial response if one is ever seen.
+
+**Moved to a bridge architecture - the device no longer stores an OAuth token at all
+(2026-07-16):** everything above this point describes the original on-device-token design in
+detail, including real problems found with it - **that design is superseded, kept here only
+as history of what was tried and why.** The specific problem that forced the change: the
+token isn't refreshable on-device and access tokens expire in hours, not months, so it needed
+manual re-entry via the portal every few hours in practice - real, ongoing friction, not a
+theoretical risk.
+
+The bridge design offered back when the on-device approach was first chosen (and declined at
+the time) is what actually shipped instead: a small script (`bridge/usage_bridge.py`, see its
+own `bridge/README.md`) runs on a trusted machine that's already logged into Claude Code for
+normal daily use - so its OAuth session gets refreshed for free, as a side effect of that
+normal use, no separate refresh logic needed. It reads the token from the same macOS Keychain
+entry Claude Code itself uses, calls Anthropic, strips the response down to just
+percentage/reset-time/label fields, and re-serves *that* over plain HTTP on the LAN. The
+device polls this bridge instead of Anthropic directly (`g_bridgeAddr`, a `host:port`
+configured via the WiFi portal or the always-on settings page below) and **never sees an
+access token at all** - a strictly better security posture than the design being replaced,
+not just a convenience fix. `USAGE_FETCH_INTERVAL_MS` (device) and `UPSTREAM_CACHE_SECONDS`
+(bridge) are both 60s and meant to stay in sync - see either file's own comment.
+
+Also switched, same day: the response shape read is now Anthropic's `limits` array, not the
+older flat `five_hour`/`seven_day`/... top-level fields - confirmed live that only `limits`
+actually contains per-model-scoped usage (e.g. a "Fable"-scoped entry never appeared in the
+flat fields, only in `limits`), matching Anthropic's own web usage dashboard's Current
+session / All models / per-model layout 1:1. `UsageLine` slots are now claimed dynamically by
+whatever keys the bridge actually sends (`findOrClaimSlot()`), not a fixed three-name list -
+see that function's own comment for the pinning behavior (a slot sticks with whichever id
+first claimed it, so a row doesn't jump position across fetches even if a model's *display
+name* changes).
+
+**Usage-zone percentage text dropped (2026-07-16):** the `usagePct[]` labels (the `"73%"`
+text right of each bar) are gone - the user's view was that the bar fill alone is enough
+information, the number was redundant.
+
+**Usage-zone re-laid-out, resets-in text moved up beside the bar (2026-07-16, same day,
+after real-hardware confirmation the pct text was actually gone):** `usageReset[]` (the
+"resets in" countdown) moved from its own line below the bar up into the column the removed
+pct text used to occupy - visually confirmed on real hardware that the label column
+(`USAGE_LABEL_W`) had room to spare, so the reallocation came from there and from shrinking
+the bar itself, not from widening the 304px zone: `USAGE_LABEL_W` 104 -> 94, `USAGE_TRACK_W`
+160 -> 154, and the old `USAGE_PCT_W` (40) is now `USAGE_RESET_W` (52) - wider than the pct
+column was, since "23h 59m" needs more room than "100%" ever did. Each row is a single line
+now instead of two, so `USAGE_ROW_H` shrank 32 -> 24 to match (otherwise the space the
+below-the-bar line used to occupy would just sit empty). `USAGE_BAND_H` and the dynamic
+row-count centering logic are unchanged formulas - they just operate at the smaller `ROW_H`
+now, automatically.
+
+**English-only pass (2026-07-16):** the clock screen's weekday/month abbreviations
+(`DA_WEEKDAYS`/`DA_MONTHS`, e.g. "ons 15. jul") and the usage-zone countdown's Danish "t"
+(timer/hours, e.g. "1t 51m") were the only remaining Danish user-facing text in the
+firmware - both switched to English (`EN_WEEKDAYS`/`EN_MONTHS`, "wed 15 jul"; countdown now
+"1h 51m"/"4d 9h"). The settings pages, dashboard labels, and Pinecil config page were
+already English.
+
+**Not yet visually confirmed on real hardware:** the exact vertical alignment of the
+smaller-font (montserrat_12) resets-in text against the bar's center (used `rowY + 5`, a
+port of the removed pct label's `rowY + 6` adjusted by eye for the smaller font, not
+measured), and whether `USAGE_RESET_W` (52px, minus 4px padding) actually fits the longest
+realistic countdown string ("23h 59m") without `LV_LABEL_LONG_CLIP` visibly truncating it -
+the safety net is in place either way, but not confirmed to be unnecessary.
+
+**Assume 0% right after a period resets, until a fresh fetch confirms it (2026-07-16):**
+`updateUsageZoneDisplay()` recomputes `resets_in` live every second from `resetsAt`, but
+`l.pct` only ever changes on the next successful `fetchClaudeUsage()` (up to 60s later, or
+longer if the bridge machine is unreachable). Without this fix, a bar would keep showing the
+*previous* period's last-known figure (e.g. 98%) for that whole gap after its own countdown
+already reached "0h 0m" - actively misleading, since the fresh period has used ~nothing yet.
+Fixed with a display-only override: once `resetsAt <= now`, treat that line's percentage as
+0% for the fill width/critical/depleted/over-pace calculations (never mutates `l.pct` itself,
+only `fetchClaudeUsage()` does that) - reverts to showing the real fetched value again as
+soon as a new fetch reports a later `resetsAt`. Not yet observed live across a real reset
+boundary; logic reasoned through, not hardware-confirmed.
+
+**WiFi+BLE running simultaneously, and the Pinecil config page (2026-07-16):** both done
+the same day - see their own section below. The offered "drop OTA to free flash headroom"
+item was never taken up (not needed - see the config page's flash-impact note below) and
+remains open if a future addition ever needs the space.
 
 ### Always-on settings page (2026-07-15)
 
@@ -479,6 +590,93 @@ along the way:
   favicon.ico) could leave it stuck. Fixed with an explicit `Connection: close` header on
   every response and a real `onNotFound()` handler (mainly to answer the favicon request
   quickly rather than leave it unhandled).
+
+### WiFi+BLE running simultaneously (2026-07-16)
+
+The on/off toggle that used to turn WiFi off for the entire time a Pinecil was connected
+(`loop()`, recovered ~83KB heap and avoided WiFi/BT coexistence contention - see the
+Claude-usage-zone section above) is gone. `wm.process()`, `ArduinoOTA.handle()`, and
+`settingsServer.handleClient()` now run unconditionally every `loop()` tick instead of only
+while the clock screen was showing, and WiFi's own retry cadence no longer waits for the
+clock screen either.
+
+This reopens a cost that was already measured and reverted once, 2026-07-15: WiFi-always-on
+costs real BLE latency (`cycle_ms` ~49-137ms vs. ~54-70ms with the old toggle). That
+experiment was reverted at the time because it bought nothing - it was tested purely as a
+hypothesis for the Claude-usage-fetch heap fragmentation, which turned out to be unrelated
+(fixed since via the usage-bridge architecture). This time the toggle is gone for a different,
+real reason: the Pinecil config page below needs `pinecyd.local` reachable *while* a Pinecil
+is connected, which the old toggle made impossible by construction. The latency cost is
+accepted, not overlooked - **not yet re-measured on real hardware this time** (see Status).
+
+A genuine WiFi drop (router reboot, out of range) - as opposed to the removed toggle - now
+re-arms `mDNS`/OTA/the settings server on reconnect via a symmetric `wifiWasConnected` check
+in `loop()`, the same safety net the old toggle used to provide incidentally.
+
+### Pinecil config page (2026-07-16, moved to the root route the same day)
+
+Lets you read and change the connected Pinecil's own settings over BLE, on the same
+`WebServer` as the plain bridge/timezone settings form. **Lives at `http://pinecyd.local/` -
+not its own `/pinecil` path** - per the user's explicit request: `handleSettingsRoot()` (bound
+to `GET /`) now dispatches on `connected`, serving this page while a Pinecil is BLE-connected
+and falling back to the original settings form otherwise. `/pinecil/data` and `/pinecil/save`
+keep their path (unchanged) - they're background `fetch()` targets the page's own JS calls,
+not something a user navigates to, so there was no reason to rename those too. Design handoff
+and reference mockup: `docs/pinecil-config-page/` (`handoff.md` was the input spec;
+`design-handoff.md` + `mockup.dc.html` are what came back from the design pass; the shipped
+page is a from-scratch vanilla-JS reimplementation of that design, not a copy of the mockup's
+file, since the mockup uses a proprietary reactive-component format not suited to this
+project's flash-constrained embedded-string approach).
+
+**Protocol, confirmed directly from `Ralim/IronOS` source** (`ble_characteristics.h`,
+`ble_handlers.cpp`, `ble_peripheral.c`), not assumed: every setting has its own BLE
+characteristic (`f6d7XXXX-5a10-4eba-aa55-33e27f9bc533`, `XXXX` = the setting's 4-hex-digit
+index), read/written as a raw `uint16` - there's no bulk read/write. Changes are RAM-only on
+the Pinecil until a separate `f6d7FFFF` characteristic is written with `1` to persist to
+flash. Of the 56 settings IronOS defines, only 41 actually have a registered characteristic
+in `ble_peripheral.c` at all (the 14 profile-mode settings and the button-swap setting don't,
+regardless of what the enum lists); this page exposes all 41 of those **except** the
+`BluetoothLE` setting itself (#37) - changing that to read-only from this very page would cut
+off its own write access on the next call, so it's deliberately left out (only editable from
+the Pinecil's own on-device menu).
+
+**Implementation shape**, mirroring the existing settings page's own conventions:
+- `GET /` serves this page (a single static HTML/CSS/JS blob from a `PROGMEM` constant,
+  `PINECIL_PAGE_HTML` - no per-request templating, since all 40 fields' metadata lives in the
+  page's own JS, not server-side) when `connected` is true, or the original bridge/timezone
+  form otherwise - see `handleSettingsRoot()`.
+- `GET /pinecil/data` reads all 40 exposed settings fresh over BLE and returns them as JSON
+  (`{"connected":bool,"values":{"<index>":<uint16>,...}}`). One BLE read per setting
+  (~20-100ms each on this hardware, per the GATT-UUID section's own measurements) - a few
+  seconds total on page load/reconnect. Not optimized further: this page has no fast-read
+  requirement, unlike the dashboard's tip-temp polling.
+- `POST /pinecil/save` takes a flat JSON object of only the fields the browser considers
+  dirty (`{"<index>":<uint16>,...}`), writes each one individually, then writes the SAVE
+  characteristic once if at least one write succeeded. Responds `{"ok":false,"error":
+  "write_failed"}` on any rejected write - the most likely real-world cause is the Pinecil's
+  `BluetoothLE` setting being set to read-only, but this layer can't distinguish that from a
+  generic BLE hiccup without deeper NimBLE error-code inspection, so it reports one generic
+  failure either way rather than guessing.
+
+**Deliberately simplified from the design mockup**, to fit this device's flash/RAM budget:
+no live countdown timer on the disconnected overlay (a plain 5-second retry poll instead, no
+tick-by-tick number), no toast fade animation, vanilla `document.createElement`/DOM calls
+instead of a component framework. Flash cost of the whole feature (UUID/protocol helpers +
+the embedded page): **~25KB** (89.4% → 90.7% of the OTA partition) - well inside the ~180KB
+that was left, so the "drop OTA for headroom" option from the next-steps list was not needed
+for this.
+
+**Carried over from the handoff doc, still unresolved:** the `Time to sleep` setting's real
+unit (#2, `SleepTime`) - IronOS's shared enum comment says minutes, Pinecil V2's own
+`configuration.h` implies raw×10 seconds instead. The page labels it `raw` rather than
+guessing, same as the handoff doc recommended - resolve by testing on real hardware before
+ever trusting a friendlier unit label here.
+
+**Not yet verified on real hardware.** This was built and compile-checked only (the device
+was off USB for this session) - the BLE settings-service UUIDs, the 40-field list, and the
+whole read/save round-trip are unverified against a live Pinecil. Test before relying on it:
+in particular, confirm the Pinecil's `BluetoothLE` setting is actually in read-write mode (1,
+not 2) on the unit in hand, or every save will fail with `write_failed`.
 
 ## Bugs found and fixed along the way
 
@@ -531,9 +729,27 @@ All found via real hardware, not caught by review or serial logs alone in most c
 
 Visually confirmed correct on real hardware while connected and heating, including a real
 boost event, with flat heap throughout that session. All bugs above found and fixed, then
-re-confirmed visually on a second round of hardware testing. The WiFi+BLE+LVGL combination
-(with the new on/off toggle) is still accumulating soak-test time as of this writing - no
-crash or disconnect observed yet, but this is the primary open stability question left.
+re-confirmed visually on a second round of hardware testing - this covers everything through
+the Claude usage zone and the always-on settings page.
+
+**WiFi+BLE running simultaneously (OTA-pushed and partially confirmed, 2026-07-16):** the
+build was pushed over `espota` to a real unit and came back up correctly with no Pinecil
+connected - `/` and (at the time, still at its own path) `/pinecil` both served real content
+over HTTP, and `/pinecil/data` correctly reported `{"connected":false}`. **Not yet confirmed
+with an actual Pinecil connected** - the whole point of this change (WiFi staying up during a
+BLE connection) hasn't been soak-tested yet (watching heap and BLE `cycle_ms`, the same
+metrics the original on/off toggle was justified by), and no real BLE settings read/write
+round-trip has happened (nothing was connected during the test).
+
+**Not yet verified at all, not even OTA-pushed:** the config page's move from `/pinecil` to
+the root route (`/`, dispatching on `connected`), the usage-zone layout change (resets-in
+text moved beside the bar, geometry constants changed), the English-only pass, and the
+assume-0%-after-reset display fix - all from this same session, compiled only. Before
+trusting any of them: push a build, then exercise the config page end-to-end against a real
+Pinecil (including a save, and confirming the unit's `BluetoothLE` setting is in read-write
+mode first, or every save will fail with `write_failed`), and look at the clock screen's
+usage zone directly to confirm the new resets-in position/width and English text render as
+intended.
 
 ## Building
 

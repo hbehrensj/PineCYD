@@ -1,0 +1,16 @@
+services:
+  usage-bridge:
+    build: .
+    container_name: pinecyd-usage-bridge
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    volumes:
+      # Holds the container's own Claude Code login - keep it private (chmod 700), it's a
+      # live OAuth session for your Claude account.
+      - ./data:/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "1m"
+        max-file: "3"

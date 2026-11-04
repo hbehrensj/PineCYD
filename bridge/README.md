@@ -37,8 +37,9 @@ instead of Anthropic directly.
 
 ## Running it
 
-**Requirements:** macOS (for the Keychain read - see `read_access_token()`), Python 3, and
-Claude Code already logged in at least once on this machine.
+**Requirements (Mac variant):** macOS (for the Keychain read - see `read_access_token()`),
+Python 3, and Claude Code already logged in at least once on this machine. For Linux/Docker,
+see "Running it in Docker" below.
 
 Manually, for a quick test:
 
@@ -82,6 +83,37 @@ launchctl load ~/Library/LaunchAgents/com.pinecyd.usage-bridge.plist
 
 The first run prompts for Keychain access approval in the macOS UI (one-time) - approve it,
 or the token read will fail every time.
+
+## Running it in Docker (e.g. a Raspberry Pi)
+
+Removes the dependency on a Mac being awake, 2026-11-04. The container can't use a Mac's
+Keychain, and it must not reuse the Mac's login either - OAuth refresh tokens rotate, so two
+machines sharing one log each other out. Instead the container gets **its own Claude Code
+login**, stored in `./data` (`.credentials.json`), and the script keeps it fresh itself by
+having the bundled Claude Code CLI refresh it shortly before it expires (see
+`refresh_file_credentials()` - `claude auth status` first, a one-word `claude -p` prompt as
+the fallback; the log says which one worked).
+
+`claude setup-token`'s long-lived token was tried first and doesn't work: it only carries the
+`user:inference` scope, and the usage endpoint returns 403 requiring `user:profile`.
+
+Copy the `bridge/` folder to the Pi, then from inside it:
+
+```sh
+mkdir -p data && chmod 700 data
+docker compose build
+docker compose run --rm usage-bridge claude auth login   # one-time: open the URL, paste the code back
+docker compose up -d
+docker compose logs -f                                    # expect "token source: file"
+curl http://localhost:8787/usage
+```
+
+Then point PineCYD at `<pi-ip>:8787` (see below), and stop the Mac's launchd agent if it's
+no longer needed (`launchctl unload ~/Library/LaunchAgents/com.pinecyd.usage-bridge.plist`).
+
+`./data` holds a live OAuth session for your Claude account - keep it out of backups you
+share and out of git (already in `.gitignore`). If the log ever shows "Token refresh did not
+extend expiry", re-run the `claude auth login` step.
 
 ## Connecting PineCYD to it
 

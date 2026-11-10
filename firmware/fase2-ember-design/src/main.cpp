@@ -897,10 +897,8 @@ struct UsageLine {
 // bridge's own cache window wouldn't get fresher data anyway, so 1 min is the actual sweet
 // spot now, not a dev-only compromise.
 static const uint32_t USAGE_FETCH_INTERVAL_MS = 60 * 1000;
-static const uint32_t USAGE_STALE_AFTER_MS    = 15 * 60 * 1000; // 15 min, per the handoff doc's stale rule
 
 static UsageLine g_usageLines[3] = {}; // all slots unclaimed until fetchClaudeUsage() fills them
-static uint32_t g_lastUsageFetchOkMs = 0; // 0 = never succeeded yet
 
 // Row geometry, shared by buildClockUi() (initial widget creation) and
 // updateUsageZoneDisplay() (per-refresh show/hide/reposition) - a single source of truth so
@@ -973,8 +971,9 @@ static UsageLine* findOrClaimSlot(const char* id) {
 
 // Fetches usage from the local bridge and updates g_usageLines in place. Runs on its own
 // schedule (see loop()) while WiFi is on; a failure just leaves the last-known values in
-// place - staleness is tracked separately via g_lastUsageFetchOkMs (last *successful*
-// fetch), not fetch attempts, matching the handoff doc's ">15min since last update" rule.
+// place - updateUsageZoneDisplay() keeps computing/showing the countdown from that last
+// known state regardless of how long ago the fetch that produced it happened (see that
+// function's own comment).
 //
 // Plain HTTP to a machine on the LAN, 2026-07-16 - no TLS, no token, no heap-fragmentation
 // risk here at all (see README.md for the full history of why the earlier direct-to-
@@ -1021,7 +1020,8 @@ static void fetchClaudeUsage() {
   // list - see UsageLine's own comment. label/period_seconds are trusted straight from the
   // bridge (it derives them from Anthropic's `limits` entries - see usage_bridge.py); this
   // loop only validates the fields it actually needs to render (utilization/resets_at).
-  bool anyOk = false;
+  time_t now    = time(nullptr);
+  bool   anyOk  = false;
   for (JsonPair kv : doc.as<JsonObject>()) {
     JsonVariant entry = kv.value();
     if (entry.isNull()) continue;
@@ -1032,6 +1032,17 @@ static void fetchClaudeUsage() {
     if (util < 0 || !resetsAtStr[0] || !labelStr[0] || periodSeconds == 0) continue;
     time_t resetsAt = parseIso8601Utc(resetsAtStr);
     if (resetsAt == 0) continue;
+    // Real bug found live, 2026-07-17: the bridge falls back to serving its last cached
+    // response on a transient upstream error (e.g. Anthropic 429s it), still as an HTTP 200 -
+    // indistinguishable here from a genuinely fresh fetch. If that cache predates a session
+    // boundary (e.g. the bridge machine only just woke up after being asleep across a reset),
+    // resetsAt already being in the past by the time this device receives it is a reliable
+    // tell that the entry is stale leftovers, not real current data - skip it rather than
+    // re-applying an already-expired reset time to the slot. Leaves the slot's existing value
+    // untouched, so the next fetch cycle (60s) gets another chance once the bridge itself
+    // catches up; updateUsageZoneDisplay()'s own "assume 0% past a known resetsAt" logic
+    // covers the display in the meantime.
+    if (resetsAt <= now) continue;
 
     UsageLine* slot = findOrClaimSlot(kv.key().c_str());
     if (!slot) continue; // all USAGE_MAX_ROWS slots already claimed by other entries
@@ -1049,7 +1060,6 @@ static void fetchClaudeUsage() {
   }
 
   if (anyOk) {
-    g_lastUsageFetchOkMs = millis();
     Serial.println("[Usage] Fetched OK");
   } else {
     Serial.println("[Usage] Response had no usable buckets");
@@ -1358,14 +1368,20 @@ static void buildClockUi() {
 // re-centered in the fixed USAGE_BAND_H budget, matching the handoff doc's "fewer rows = more
 // centered whitespace" 2-line spec.
 //
-// Whole zone hidden - not just desaturated with a "stale" tag - whenever there's no data at
-// all OR the last successful fetch is more than USAGE_STALE_AFTER_MS old, 2026-07-16 (see
-// README.md): now that the data comes from a bridge script on the user's own Mac rather than
-// directly from Anthropic, "stale" routinely means "that Mac is asleep/off," a normal and
-// expected state, not a rare failure - showing old percentages as if current in that case
-// would be actively misleading, per the user's explicit call ("det vil jo være outdated").
-// This replaced an earlier design (dim the bars + a "FORSINKET" corner tag, numbers still
-// visible) that this superseded.
+// Zone visibility now depends only on whether a bucket has *ever* had data (haveData), not
+// on how long ago the fetch that produced it was, 2026-07-16 (see README.md) - reverses the
+// same-day-earlier "hide the whole zone once the last successful fetch is >15min old"
+// design (which itself replaced an even earlier "dim + FORSINKET tag" design). Per the
+// user's explicit request: the CYD already knows each bucket's resetsAt/periodSeconds from
+// its last successful fetch, so the resets-in countdown and pace marker can be computed and
+// kept live from the device's own clock alone, with no dependency on the bridge machine
+// being reachable *right now* - hiding the whole zone over that was throwing away a
+// countdown that was never actually stale. What genuinely *can* go stale - the percentage/
+// fill value, if real usage changed while the bridge machine was unreachable - is handled
+// narrowly instead of by hiding everything: see the "assume 0% after a period resets" logic
+// below, which is what actually stops a long-unreachable bucket from showing a stuck old
+// percentage forever (once its own known resetsAt passes, it falls back to an honest 0%
+// locally, fetch or no fetch).
 static void updateUsageZoneDisplay() {
   time_t now = time(nullptr);
 
@@ -1375,8 +1391,7 @@ static void updateUsageZoneDisplay() {
     if (g_usageLines[i].haveData) visible[visCount++] = i;
   }
 
-  bool stale = (g_lastUsageFetchOkMs == 0) || (millis() - g_lastUsageFetchOkMs > USAGE_STALE_AFTER_MS);
-  if (visCount == 0 || stale) {
+  if (visCount == 0) {
     lv_obj_add_flag(usageZone, LV_OBJ_FLAG_HIDDEN);
     return;
   }

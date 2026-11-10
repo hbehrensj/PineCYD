@@ -569,6 +569,50 @@ only `fetchClaudeUsage()` does that) - reverts to showing the real fetched value
 soon as a new fetch reports a later `resetsAt`. Not yet observed live across a real reset
 boundary; logic reasoned through, not hardware-confirmed.
 
+**Stopped hiding the whole zone when the bridge fetch is stale (2026-07-16, reversing a
+same-day-earlier decision):** `updateUsageZoneDisplay()` used to hide the entire usage zone
+once the last *successful* fetch was more than 15 minutes old (`USAGE_STALE_AFTER_MS`,
+`g_lastUsageFetchOkMs` - both now removed), on the reasoning that a bridge-machine-asleep
+percentage would be actively misleading if shown as current. **Per the user's explicit
+request:** the CYD already knows each bucket's `resetsAt`/`periodSeconds` from its last
+successful fetch, so the resets-in countdown and pace marker can - and now do - keep running
+live from the device's own clock indefinitely, independent of whether the bridge machine is
+reachable right now. Visibility is now driven only by `haveData` (has this bucket *ever* had
+a real fetch) - a bucket that's had data once keeps showing it, stale fetch or not. The part
+that genuinely could go stale - the percentage itself, if real usage changed while
+unreachable - isn't handled by hiding anymore either: the "assume 0% after a period resets"
+fix directly above is what actually prevents a long-unreachable bucket from showing a stuck
+old percentage forever. Real tradeoff, accepted deliberately: if usage changes on another
+machine/via the API while this device's bridge is unreachable, the shown percentage can be
+wrong until the next successful fetch - preferred over hiding a countdown that was never
+actually stale in the first place.
+
+**Real bug found live the next morning (2026-07-17): the bridge could re-serve an
+already-expired `resets_at` as if it were fresh.** The user's Mac had been asleep overnight,
+spanning a "session" reset; when it woke, both the user's own Claude Code activity and this
+bridge's own polling hit Anthropic's usage endpoint at once, and Anthropic returned `HTTP
+429` for a while. `usage_bridge.py`'s existing "serve stale cache on a transient upstream
+error" fallback (meant to ride out a brief blip, not this) kept re-serving its
+*pre-sleep, already-expired* cached response as a plain `HTTP 200` for as long as the 429s
+continued - completely indistinguishable from a fresh fetch to the device, which dutifully
+displayed the resulting `resets_in` as "0h 0m" (correctly computed from what looked like
+current data - it just wasn't). Two fixes, one on each side:
+- **Bridge:** `MAX_STALE_CACHE_SECONDS` (15 min) bounds the stale-cache-on-error fallback -
+  short enough it can never span a real session boundary (the shortest limit window is 5
+  hours), long enough to still ride out a brief rate-limit storm. Beyond that bound, the
+  bridge returns the real error code instead of masquerading as fresh data.
+- **Firmware:** `fetchClaudeUsage()` now skips (doesn't apply) any entry whose `resets_at`
+  is already `<= now` at the moment it's received - defense in depth, in case the bridge
+  (this one or a future rewrite) ever serves obviously-expired data despite its own bound.
+  Leaves the slot's existing value alone rather than re-applying nonsense, so the next 60s
+  fetch cycle gets a real chance once the upstream error clears.
+
+Confirmed live: caught mid-429-storm via the bridge's own log (`~/Library/Logs/pinecyd-
+usage-bridge.log`, repeating `Anthropic returned HTTP 429` lines each followed by a `200` to
+the device), and confirmed the storm had already cleared and the bridge was serving correct,
+current data by the time both fixes were written - not yet re-observed live through a second
+real occurrence of the original failure mode.
+
 **WiFi+BLE running simultaneously, and the Pinecil config page (2026-07-16):** both done
 the same day - see their own section below. The offered "drop OTA to free flash headroom"
 item was never taken up (not needed - see the config page's flash-impact note below) and

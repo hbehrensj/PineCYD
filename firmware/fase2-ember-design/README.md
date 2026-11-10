@@ -722,6 +722,41 @@ whole read/save round-trip are unverified against a live Pinecil. Test before re
 in particular, confirm the Pinecil's `BluetoothLE` setting is actually in read-write mode (1,
 not 2) on the unit in hand, or every save will fail with `write_failed`.
 
+### Alert mode, "red screen" (2026-11-10)
+
+Spec: `docs/alert-mode/handoff.md`. Optional and invisible unless configured: set **Alert
+URL** on the settings page (`http://pinecyd.local/`, shown while no Pinecil is connected) to
+an external status server's endpoint, e.g. `http://<server>/api/alert`. Blank turns it off -
+no polling, nothing shown.
+
+- Polls `GET <Alert URL>` every 30s on both screens. `{"alert": true, "level": "crit", "text":
+  ..., "since": ...}` shows the alert; anything else (including other `level` values) doesn't.
+- No Pinecil connected: full red screen with a warning icon, the text, "siden HH:MM" (local
+  time from `since`) and a small clock. Pinecil connected: only a 30px red top bar, so the
+  soldering data stays visible (it covers just the "TIP TEMP"/mode captions).
+- **Display-only:** no touch, no button, no ack. Acknowledging happens on the server, which
+  then answers `{"alert": false}`.
+- **Dead-man:** if the server has answered at least once since boot (or since the URL was
+  changed) and then fails (timeout, HTTP error, invalid JSON) for 10 minutes, the screen shows
+  "Statusserver svarer ikke". Never shown if it hasn't answered once since boot, so a power
+  cut where PineCYD boots before the server doesn't turn the screen red. Clears by itself on
+  the next good answer.
+- The on-board RGB LED is constant red during an alert (no blinking).
+- Plain HTTP only (`http://`), short 1.5s timeouts: the poll also runs while soldering, and a
+  dead server would otherwise stall the BLE loop.
+- Background `#B3241A`: an ember-family deep red, 5.4:1 against the text color after RGB565
+  quantization (WCAG AA). The usage zone's `COLOR_USAGE_ALERT` only reaches ~3:1.
+
+**Fonts and flash.** Built-in Montserrat has no æøå, so the text uses a new 22px font with
+ASCII + æøåÆØÅ only (`src/fonts/lv_font_montserrat_22_da.c`, ~13KB). The warning icon is a
+single-glyph font (`lv_font_alert_icon_44.c`): the first attempt used the built-in 48px
+Montserrat for the icon, which pulled that whole unused font into the binary (+97KB,
+96.4% flash). The whole feature costs ~17KB: 90.7% -> 91.6% of the OTA slot.
+
+**Testing:** `tools/alert_mock.py` serves the contract and switches modes via
+`GET /mode/<name>` (off, crit, crit2, long, warn, invalid, http500, down) - see its docstring
+for the full test list.
+
 ## Bugs found and fixed along the way
 
 All found via real hardware, not caught by review or serial logs alone in most cases:

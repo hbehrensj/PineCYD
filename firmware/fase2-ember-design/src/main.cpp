@@ -74,6 +74,21 @@ using fs::File;
 // made the value invisible on real hardware (see buildUi() for why) - this is the reliable
 // fix, at the user's request for a ~50% bigger hero number, 2026-07-13.
 LV_FONT_DECLARE(lv_font_montserrat_72_digits);
+// Alert-mode text font, 2026-11-10 (see docs/alert-mode/handoff.md): built-in Montserrat only
+// covers 0x20-0x7F plus a few symbols (checked in lv_font_montserrat_14.c's own Opts line), so
+// alert text with æøå would render with missing glyphs. One size only, ASCII + æøåÆØÅ and
+// nothing else, to keep the flash cost down. Same generator as the 72px font above:
+//   lv_font_conv --no-compress --bpp 4 --size 22 --font Montserrat-Medium.ttf
+//     -r 0x20-0x7E,0xC5,0xC6,0xD8,0xE5,0xE6,0xF8 --format lvgl
+//     --lv-font-name lv_font_montserrat_22_da --force-fast-kern-format
+LV_FONT_DECLARE(lv_font_montserrat_22_da);
+// Alert-mode warning icon: a single glyph (LV_SYMBOL_WARNING, U+F071) from the FontAwesome
+// file LVGL's own symbols come from. Using the built-in lv_font_montserrat_48 for this one
+// icon instead pulled that whole font into the binary (+97KB, measured 2026-11-10) since
+// nothing else uses it - with ~9% flash headroom that's not affordable.
+//   lv_font_conv --no-compress --bpp 4 --size 44 --font FontAwesome5-Solid+Brands+Regular.woff
+//     -r 0xF071 --format lvgl --lv-font-name lv_font_alert_icon_44
+LV_FONT_DECLARE(lv_font_alert_icon_44);
 
 // --- Confirmed IronOS BLE UUIDs (Pinecil V2 only) - Live Data service ---
 static const char* SERVICE_LIVE_DATA  = "d85ef000-168e-4a71-aa55-33e27f9bc533";
@@ -272,6 +287,11 @@ static WiFiManagerParameter* pTzParam = nullptr; // registered in setup(), read 
 static String                g_bridgeAddr;
 static WiFiManagerParameter* pBridgeParam = nullptr; // registered in setup(), read below
 
+// Alert mode, 2026-11-10 (docs/alert-mode/handoff.md): full URL of an external status
+// server's alert endpoint, e.g. "http://<server>/api/alert". Empty = feature off entirely
+// (no polling, nothing shown). Only settable from the settings page, not the captive portal.
+static String g_alertUrl;
+
 // Fires when the portal's form is submitted (WiFiManager's own save-config hook) -
 // independent of whether the WiFi connect attempt that follows succeeds, so this also
 // captures these fields on a portal session that's only being used to switch networks.
@@ -416,6 +436,7 @@ static void        fetchClaudeUsage(); // defined below; forward-declared for ha
 // browser's Save request for the fetch's own up-to-16s HTTPS timeout budget, confirmed
 // live, 2026-07-15 (the page just hung on "Waiting for pinecyd.local...").
 static bool g_forceUsageFetch = false;
+static void resetAlertState(); // defined with the alert-mode code below
 
 // Explicit "Connection: close" on every response below - the ESP32 WebServer library is
 // synchronous/single-connection and handles HTTP keep-alive poorly; a browser reload often
@@ -450,6 +471,22 @@ static void handleSettingsSave() {
     prefs.end();
     configTzTime(g_timezone.c_str(), "pool.ntp.org", "time.google.com");
     Serial.println("[Settings] Timezone updated via web page");
+  }
+  // Unlike the two fields above, blank here is meaningful: it turns alert mode off. The
+  // field is pre-filled with the current value, so leaving it untouched keeps it. Only acted
+  // on when the form actually sent the field (an older/scripted POST without it changes
+  // nothing).
+  if (settingsServer.hasArg("alert")) {
+    String url = settingsServer.arg("alert");
+    url.trim();
+    if (url != g_alertUrl) {
+      g_alertUrl = url;
+      prefs.begin("pinecyd", false);
+      prefs.putString("alert_url", g_alertUrl);
+      prefs.end();
+      resetAlertState(); // new server = no history; also forces an early poll
+      Serial.printf("[Settings] Alert URL %s via web page\n", g_alertUrl.isEmpty() ? "cleared" : "updated");
+    }
   }
   settingsServer.sendHeader("Location", "/");
   settingsServer.sendHeader("Connection", "close");
@@ -759,6 +796,10 @@ static void handleSettingsRoot() {
       "<input type='text' name='tz' value='" +
       g_timezone +
       "' style='width:100%; box-sizing:border-box;'><br><br>"
+      "<label>Alert URL (http://..., blank = alert mode off):</label><br>"
+      "<input type='text' name='alert' value='" +
+      g_alertUrl +
+      "' placeholder='http://server/api/alert' style='width:100%; box-sizing:border-box;'><br><br>"
       "<input type='submit' value='Save'>"
       "</form></body></html>";
   settingsServer.send(200, "text/html", html);
@@ -1657,6 +1698,252 @@ static bool connectToPinecil() {
   return true;
 }
 
+// --- Alert mode ("red screen"), 2026-11-10 - see docs/alert-mode/handoff.md ---
+// Polls an external status server (g_alertUrl, set on the settings page) and turns the
+// screen red only when that server says something needs attention. Display-only by design:
+// no touch, no button, no ack from here - acknowledging happens on the server, which then
+// simply answers {"alert": false}. Empty URL = this whole block is inert.
+//
+// Contract: GET <url> -> 200 {"alert": false}
+//                     or 200 {"alert": true, "level": "crit", "text": "...", "since": "<ISO8601 Z>"}
+// Any level other than "crit" counts as no alert. Plain HTTP only (no TLS on this board's
+// heap budget - see the usage bridge history in README.md).
+//
+// Views: full red screen when no Pinecil is connected; only a red top bar while one is, so
+// the soldering data stays visible. Both live on lv_layer_top(), above whichever screen is
+// loaded, so screen switches never need to know about them.
+//
+// Dead-man rule: if the server has answered at least once since boot and then stops answering
+// (timeout, HTTP error or invalid JSON) for ALERT_OFFLINE_AFTER_MS, show "Statusserver svarer
+// ikke" - if it's down, nothing else will say so. Never shown if it hasn't answered once since
+// boot, so a power cut where this board boots before the server doesn't light up red.
+static const uint32_t ALERT_POLL_INTERVAL_MS = 30 * 1000;
+static const uint32_t ALERT_OFFLINE_AFTER_MS = 10 * 60 * 1000;
+static const size_t   ALERT_MAX_CHARS        = 40; // codepoints, per the contract
+// Short timeouts on purpose: this also polls while a Pinecil is connected, and a blocking
+// HTTP call stalls the BLE poll loop for its duration. A LAN server answers in milliseconds;
+// a dead one costs at most ~3s once every 30s.
+static const uint16_t ALERT_HTTP_TIMEOUT_MS  = 1500;
+
+// Deep red from the ember family (darker than COLOR_USAGE_ALERT, which only reaches ~3:1
+// against COLOR_USAGE_TEXT). #B3241A vs #F2E7D8 = 5.4:1 after RGB565 quantization - passes
+// WCAG AA (4.5:1) for normal-size text.
+static const lv_color_t COLOR_ALERT_BG = LV_COLOR_MAKE(0xB3, 0x24, 0x1A);
+
+// The CYD's on-board RGB LED (common anode: LOW = on). Constant red during an alert, never
+// blinking (handoff's graphics rules).
+static const int LED_R_PIN = 4;
+static const int LED_G_PIN = 16;
+static const int LED_B_PIN = 17;
+
+static bool     g_alertActive       = false; // last good answer said alert + crit
+static char     g_alertText[ALERT_MAX_CHARS * 4 + 1] = "";
+static time_t   g_alertSince        = 0;     // 0 = unknown / unparseable
+static bool     g_alertServerEverOk = false; // answered validly at least once since boot/URL change
+static uint32_t g_alertLastOkMs     = 0;
+static time_t   g_alertLastOkEpoch  = 0;     // wall-clock of last good answer, for the offline view's "siden"
+static bool     g_forceAlertFetch   = false;
+
+static lv_obj_t* alertFull;
+static lv_obj_t* alertFullText;
+static lv_obj_t* alertFullSince;
+static lv_obj_t* alertFullClock;
+static lv_obj_t* alertBar;
+static lv_obj_t* alertBarText;
+
+static void resetAlertState() {
+  g_alertActive       = false;
+  g_alertText[0]      = '\0';
+  g_alertSince        = 0;
+  g_alertServerEverOk = false;
+  g_alertLastOkMs     = 0;
+  g_alertLastOkEpoch  = 0;
+  g_forceAlertFetch   = true;
+}
+
+// Copies at most maxChars UTF-8 codepoints, never splitting a multi-byte sequence.
+static void copyUtf8Truncated(char* dst, size_t dstSize, const char* src, size_t maxChars) {
+  size_t out = 0, chars = 0;
+  while (*src && chars < maxChars) {
+    unsigned char c   = (unsigned char)*src;
+    size_t        len = (c < 0x80) ? 1 : ((c >> 5) == 0x6) ? 2 : ((c >> 4) == 0xE) ? 3 : ((c >> 3) == 0x1E) ? 4 : 1;
+    if (out + len >= dstSize) break;
+    for (size_t i = 0; i < len && src[i]; i++) dst[out++] = src[i];
+    src += len;
+    chars++;
+  }
+  dst[out] = '\0';
+}
+
+static void fetchAlert() {
+  if (g_alertUrl.isEmpty() || WiFi.status() != WL_CONNECTED) return;
+  if (!g_alertUrl.startsWith("http://")) {
+    Serial.println("[Alert] URL must start with http:// (no TLS) - not polling");
+    return;
+  }
+
+  WiFiClient client;
+  HTTPClient http;
+  http.setConnectTimeout(ALERT_HTTP_TIMEOUT_MS);
+  http.setTimeout(ALERT_HTTP_TIMEOUT_MS);
+  if (!http.begin(client, g_alertUrl)) {
+    Serial.println("[Alert] http.begin() failed");
+    return;
+  }
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    Serial.printf("[Alert] HTTP %d from status server\n", code);
+    http.end();
+    return;
+  }
+  String body = http.getString(); // buffered first, same reason as fetchClaudeUsage()
+  http.end();
+
+  JsonDocument         doc;
+  DeserializationError err = deserializeJson(doc, body);
+  if (err || !doc.is<JsonObject>() || !doc["alert"].is<bool>()) {
+    Serial.printf("[Alert] Invalid JSON from status server (%s)\n", err ? err.c_str() : "missing 'alert' bool");
+    return;
+  }
+
+  // A valid answer - counts for the dead-man rule even if it says "no alert".
+  g_alertServerEverOk = true;
+  g_alertLastOkMs     = millis();
+  time_t now          = time(nullptr);
+  g_alertLastOkEpoch  = (now > 1700000000) ? now : 0; // 0 until NTP has synced
+
+  bool        alert = doc["alert"].as<bool>();
+  const char* level = doc["level"] | "";
+  if (alert && strcmp(level, "crit") == 0) {
+    copyUtf8Truncated(g_alertText, sizeof(g_alertText), doc["text"] | "", ALERT_MAX_CHARS);
+    if (!g_alertText[0]) strcpy(g_alertText, "Alarm");
+    g_alertSince = parseIso8601Utc(doc["since"] | "");
+    if (!g_alertActive) Serial.printf("[Alert] Alert on: %s\n", g_alertText);
+    g_alertActive = true;
+  } else {
+    if (g_alertActive) Serial.println("[Alert] Alert cleared by server");
+    g_alertActive = false;
+  }
+}
+
+static void buildAlertUi() {
+  lv_obj_t* top = lv_layer_top();
+
+  alertFull = lv_obj_create(top);
+  lv_obj_remove_style_all(alertFull);
+  lv_obj_set_size(alertFull, SCREEN_W, SCREEN_H);
+  lv_obj_set_style_bg_color(alertFull, COLOR_ALERT_BG, 0);
+  lv_obj_set_style_bg_opa(alertFull, LV_OPA_COVER, 0);
+  lv_obj_clear_flag(alertFull, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t* icon = lv_label_create(alertFull);
+  lv_label_set_text(icon, LV_SYMBOL_WARNING);
+  lv_obj_set_style_text_font(icon, &lv_font_alert_icon_44, 0);
+  lv_obj_set_style_text_color(icon, COLOR_USAGE_TEXT, 0);
+  lv_obj_align(icon, LV_ALIGN_TOP_MID, 0, 20);
+
+  alertFullText = lv_label_create(alertFull);
+  lv_obj_set_width(alertFullText, SCREEN_W - 24);
+  lv_label_set_long_mode(alertFullText, LV_LABEL_LONG_WRAP);
+  lv_obj_set_style_text_align(alertFullText, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_set_style_text_font(alertFullText, &lv_font_montserrat_22_da, 0);
+  lv_obj_set_style_text_color(alertFullText, COLOR_USAGE_TEXT, 0);
+  lv_label_set_text(alertFullText, "");
+  lv_obj_align(alertFullText, LV_ALIGN_TOP_MID, 0, 86);
+
+  alertFullSince = lv_label_create(alertFull);
+  lv_obj_set_width(alertFullSince, SCREEN_W);
+  lv_obj_set_style_text_align(alertFullSince, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_set_style_text_font(alertFullSince, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(alertFullSince, COLOR_USAGE_TEXT, 0);
+  lv_label_set_text(alertFullSince, "");
+  lv_obj_align(alertFullSince, LV_ALIGN_TOP_MID, 0, 150);
+
+  alertFullClock = lv_label_create(alertFull);
+  lv_obj_set_width(alertFullClock, SCREEN_W);
+  lv_obj_set_style_text_align(alertFullClock, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_set_style_text_font(alertFullClock, &lv_font_montserrat_24, 0);
+  lv_obj_set_style_text_color(alertFullClock, COLOR_USAGE_TEXT, 0);
+  lv_label_set_text(alertFullClock, "--:--");
+  lv_obj_align(alertFullClock, LV_ALIGN_BOTTOM_MID, 0, -14);
+  lv_obj_add_flag(alertFull, LV_OBJ_FLAG_HIDDEN);
+
+  // Top bar while soldering: covers only the dashboard's small "TIP TEMP"/mode captions
+  // (y=18-32), not the tip value, target, power or chart.
+  alertBar = lv_obj_create(top);
+  lv_obj_remove_style_all(alertBar);
+  lv_obj_set_size(alertBar, SCREEN_W, 30);
+  lv_obj_set_style_bg_color(alertBar, COLOR_ALERT_BG, 0);
+  lv_obj_set_style_bg_opa(alertBar, LV_OPA_COVER, 0);
+  lv_obj_clear_flag(alertBar, LV_OBJ_FLAG_SCROLLABLE);
+
+  alertBarText = lv_label_create(alertBar);
+  lv_obj_set_width(alertBarText, SCREEN_W - 12);
+  lv_label_set_long_mode(alertBarText, LV_LABEL_LONG_DOT); // one line; no scrolling (no motion)
+  lv_obj_set_style_text_font(alertBarText, &lv_font_montserrat_22_da, 0);
+  lv_obj_set_style_text_color(alertBarText, COLOR_USAGE_TEXT, 0);
+  lv_label_set_text(alertBarText, "");
+  lv_obj_align(alertBarText, LV_ALIGN_LEFT_MID, 6, 0);
+  lv_obj_add_flag(alertBar, LV_OBJ_FLAG_HIDDEN);
+
+  pinMode(LED_R_PIN, OUTPUT);
+  pinMode(LED_G_PIN, OUTPUT);
+  pinMode(LED_B_PIN, OUTPUT);
+  digitalWrite(LED_R_PIN, HIGH);
+  digitalWrite(LED_G_PIN, HIGH);
+  digitalWrite(LED_B_PIN, HIGH);
+}
+
+// Only touches a label when its text actually changes, so the once-a-second refresh doesn't
+// force a redraw of an unchanged red screen.
+static void setLabelIfChanged(lv_obj_t* label, const char* text) {
+  if (strcmp(lv_label_get_text(label), text) != 0) lv_label_set_text(label, text);
+}
+
+static void showOrHide(lv_obj_t* obj, bool show) {
+  if (show == lv_obj_has_flag(obj, LV_OBJ_FLAG_HIDDEN)) {
+    if (show) lv_obj_clear_flag(obj, LV_OBJ_FLAG_HIDDEN);
+    else lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
+  }
+}
+
+// Called once a second from loop(), independent of which screen is showing.
+static void updateAlertDisplay(bool pinecilConnected, bool portalActive) {
+  bool offline = !g_alertUrl.isEmpty() && g_alertServerEverOk &&
+                 (millis() - g_alertLastOkMs > ALERT_OFFLINE_AFTER_MS);
+  bool show = !g_alertUrl.isEmpty() && !portalActive && (offline || g_alertActive);
+
+  if (!show) {
+    showOrHide(alertFull, false);
+    showOrHide(alertBar, false);
+    digitalWrite(LED_R_PIN, HIGH);
+    return;
+  }
+
+  const char* text  = offline ? "Statusserver svarer ikke" : g_alertText;
+  time_t      since = offline ? g_alertLastOkEpoch : g_alertSince;
+
+  char      sinceBuf[24] = "";
+  struct tm lt;
+  if (since > 0 && localtime_r(&since, &lt)) snprintf(sinceBuf, sizeof(sinceBuf), "siden %02d:%02d", lt.tm_hour, lt.tm_min);
+
+  if (pinecilConnected) {
+    setLabelIfChanged(alertBarText, text);
+    showOrHide(alertFull, false);
+    showOrHide(alertBar, true);
+  } else {
+    setLabelIfChanged(alertFullText, text);
+    setLabelIfChanged(alertFullSince, sinceBuf);
+    struct tm now;
+    char      clockBuf[8] = "--:--";
+    if (getLocalTime(&now, 0)) snprintf(clockBuf, sizeof(clockBuf), "%02d:%02d", now.tm_hour, now.tm_min);
+    setLabelIfChanged(alertFullClock, clockBuf);
+    showOrHide(alertBar, false);
+    showOrHide(alertFull, true);
+  }
+  digitalWrite(LED_R_PIN, LOW);
+}
+
 void setup() {
   Serial.begin(115200);
   delay(200);
@@ -1686,6 +1973,7 @@ void setup() {
   buildUi();
   buildClockUi();
   buildWifiConfigUi();
+  buildAlertUi();
   lv_scr_load(scr_clock); // not connected to a Pinecil yet - start on the clock
   clockScreenActive = true;
   lv_timer_handler();
@@ -1722,6 +2010,7 @@ void setup() {
   prefs.begin("pinecyd", true);
   g_timezone   = prefs.getString("tz", DEFAULT_TZ);
   g_bridgeAddr = prefs.getString("bridge_addr", "");
+  g_alertUrl   = prefs.getString("alert_url", "");
   prefs.end();
   static WiFiManagerParameter tzParam("tz", "Timezone (POSIX TZ string)", g_timezone.c_str(), 63);
   pTzParam = &tzParam;
@@ -1931,6 +2220,21 @@ void loop() {
     lastUsageFetch     = millis();
     g_forceUsageFetch  = false;
     fetchClaudeUsage();
+  }
+
+  // Alert mode (see fetchAlert()) - polled on both screens, unlike the usage fetch above,
+  // since the soldering view shows the red top bar.
+  static uint32_t lastAlertFetch = 0;
+  if (!g_alertUrl.isEmpty() && wifiNowConnected &&
+      (g_forceAlertFetch || millis() - lastAlertFetch >= ALERT_POLL_INTERVAL_MS)) {
+    lastAlertFetch    = millis();
+    g_forceAlertFetch = false;
+    fetchAlert();
+  }
+  static uint32_t lastAlertUpdate = 0;
+  if (millis() - lastAlertUpdate >= 1000) {
+    lastAlertUpdate = millis();
+    updateAlertDisplay(connected, wifiConfigActive);
   }
 
   // Poll cycle: tip_temp every time, plus exactly one of the other five characteristics
